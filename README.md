@@ -71,7 +71,7 @@
 ```python
 # 1) 라이브러리 + 한글 폰트
 !pip install -q langchain langchain-openai openai streamlit pillow
-!apt-get install -y -qq fonts-nanum
+!apt-get install -y -qq fonts-nanum || echo '폰트 설치 실패 - 코드가 자동으로 받아옵니다'
 
 # 2) API 키 (Colab 왼쪽 🔑 보안 비밀에 'openai' 로 저장 후 토글 ON)
 import os

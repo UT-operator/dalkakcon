@@ -16,9 +16,10 @@ AI에게 "하트를 그려줘"라고 부탁하면 매번 다르게 나오고 비
 
 from __future__ import annotations
 
+import glob
 import math
 import os
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -84,30 +85,109 @@ def _scale_of(anchors) -> float:
 
 # ------------------------------------------------------------------- 폰트
 
-_FONT_CANDIDATES = [
-    # Colab / 리눅스 (apt-get install -y fonts-nanum)
-    "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
-    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    # 윈도우
-    "C:/Windows/Fonts/malgunbd.ttf",
-    "C:/Windows/Fonts/malgun.ttf",
+# 폰트를 '고정 경로 목록'으로 찾으면 환경이 조금만 달라도 못 찾는다.
+# (Colab에서 apt-get 이 조용히 실패해 글자가 전부 네모로 나온 적이 있다)
+# 그래서 실제로 디렉터리를 뒤지고, 한글 글리프가 '진짜 있는지'까지 확인한다.
+
+_FONT_DIRS = [
+    "/usr/share/fonts", "/usr/local/share/fonts",
+    os.path.expanduser("~/.fonts"), "C:/Windows/Fonts",
 ]
+# 앞에 있을수록 우선. 나눔고딕은 OFL 라이선스라 상업 사용이 허용된다.
+_FONT_PREFER = ["nanumgothicbold", "nanumgothic", "malgunbd", "malgun",
+                "notosanskr", "notosanscjk", "applesdgothic", "gulim", "batang"]
+
+# 시스템에 아무것도 없을 때 받아오는 곳 (Google Fonts, OFL)
+_FONT_URL = ("https://github.com/google/fonts/raw/main/ofl/"
+             "nanumgothic/NanumGothic-Regular.ttf")
+_LOCAL_FONT = "NanumGothic.ttf"
+
+_resolved_font = None          # 한 번 찾으면 재사용
+
+
+def _has_korean(path: str) -> bool:
+    """
+    그 폰트에 한글 글리프가 실제로 있는지 확인한다.
+
+    Pillow 는 폰트 폴백(다른 폰트에서 빌려오기)을 하지 않는다. 그래서 한글이
+    없는 폰트로 찍으면 네모(두부)가 나온다. 그런데 크기는 정상으로 보고되므로
+    getbbox() 만으로는 구분할 수 없다.
+    여기서는 '가' 와 '쓰이지 않는 문자'의 렌더 결과를 비교한다.
+    둘이 같으면 둘 다 네모라는 뜻이다.
+    """
+    try:
+        f = ImageFont.truetype(path, 20)
+        return bytes(f.getmask("가")) != bytes(f.getmask("\ue000"))
+    except Exception:
+        return False
+
+
+def find_korean_font() -> Optional[str]:
+    """시스템에서 한글이 되는 폰트를 찾는다. 없으면 None."""
+    global _resolved_font
+    if _resolved_font and os.path.exists(_resolved_font):
+        return _resolved_font
+
+    if os.path.exists(_LOCAL_FONT) and _has_korean(_LOCAL_FONT):
+        _resolved_font = _LOCAL_FONT
+        return _resolved_font
+
+    found = []
+    for d in _FONT_DIRS:
+        if os.path.isdir(d):
+            for ext in ("ttf", "ttc", "otf"):
+                found += glob.glob(os.path.join(d, "**", f"*.{ext}"), recursive=True)
+
+    def rank(p):
+        name = os.path.basename(p).lower().replace("-", "").replace("_", "")
+        for i, key in enumerate(_FONT_PREFER):
+            if key in name:
+                return i
+        return len(_FONT_PREFER)
+
+    # 이름이 익숙한 것부터, 그다음 나머지를 (너무 오래 걸리지 않게) 일부만
+    ordered = sorted(found, key=rank)
+    for p in ordered[:80]:
+        if _has_korean(p):
+            _resolved_font = p
+            return p
+    return None
+
+
+def ensure_korean_font(download: bool = True) -> Optional[str]:
+    """
+    한글 폰트를 확보한다. 시스템에 없으면 나눔고딕을 받아온다.
+    Colab 에서 apt-get 이 실패해도 이쪽으로 복구된다.
+    """
+    global _resolved_font
+    p = find_korean_font()
+    if p or not download:
+        return p
+    try:
+        import urllib.request
+        urllib.request.urlretrieve(_FONT_URL, _LOCAL_FONT)
+        if _has_korean(_LOCAL_FONT):
+            _resolved_font = _LOCAL_FONT
+            return _resolved_font
+    except Exception:
+        pass
+    return None
 
 
 def load_font(size: int) -> ImageFont.FreeTypeFont:
-    """한글이 되는 폰트를 찾아 불러온다. 없으면 기본 폰트로 떨어진다."""
-    for path in _FONT_CANDIDATES:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                continue
+    """한글이 되는 폰트를 불러온다. 처음 쓸 때 없으면 받아온다."""
+    path = ensure_korean_font()
+    if path:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            pass
     return ImageFont.load_default()
 
 
 def font_available() -> bool:
-    return any(os.path.exists(p) for p in _FONT_CANDIDATES)
+    """한글 폰트를 쓸 수 있는지. 없으면 받아와서라도 확보한다."""
+    return ensure_korean_font() is not None
 
 
 # --------------------------------------------------- 다크모드 흰 테두리
