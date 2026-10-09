@@ -78,12 +78,15 @@ import os
 from google.colab import userdata
 os.environ["OPENAI_API_KEY"] = userdata.get("openai")
 
-# 3) 코드 받아오기
-import urllib.request
+# 3) 코드 받아오기 (고친 뒤에는 이 셀만 다시 실행하면 된다)
+import urllib.request, sys, importlib
 BASE = "https://raw.githubusercontent.com/UT-operator/dalkakcon/main/"
-for f in ["emoticon_tools.py", "geo_motion.py", "geo_effects.py",
-          "charsample.py", "app.py", "test_integration.py"]:
+FILES = ["emoticon_tools.py", "geo_motion.py", "geo_effects.py",
+         "charsample.py", "app.py", "test_integration.py"]
+for f in FILES:
     urllib.request.urlretrieve(BASE + f, f)
+    sys.modules.pop(f[:-3], None)      # 옛날 모듈 기억을 지운다
+importlib.invalidate_caches()
 
 # 4) 통합 테스트 (API 4회, 약 $0.04)
 !python test_integration.py

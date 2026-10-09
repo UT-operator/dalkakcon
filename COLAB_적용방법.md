@@ -48,7 +48,7 @@ https://github.com/UT-operator/dalkakcon
 API 키 셀(`userdata.get('openai')`) 아래에 `+ 코드` 로 새 셀을 만들고:
 
 ```python
-import urllib.request, os
+import urllib.request, os, sys, importlib
 
 BASE = "https://raw.githubusercontent.com/UT-operator/dalkakcon/main/"
 FILES = ["emoticon_tools.py", "geo_motion.py", "geo_effects.py",
@@ -57,11 +57,21 @@ FILES = ["emoticon_tools.py", "geo_motion.py", "geo_effects.py",
 for f in FILES:
     urllib.request.urlretrieve(BASE + f, f)
     print(f"  {f:<22} {os.path.getsize(f)/1024:6.1f}KB")
-print("\n코드 받기 완료")
+
+# 파이썬은 한 번 불러온 모듈을 '기억'한다. 파일만 새로 받으면 메모리에는
+# 옛날 모듈이 그대로 남아 AttributeError 가 난다. 그래서 그 기억을 지운다.
+for f in FILES:
+    sys.modules.pop(f[:-3], None)
+importlib.invalidate_caches()
+
+print("\n코드 받기 완료 (모듈 캐시도 비웠습니다)")
 ```
 
 **이 셀만 먼저 실행해서** 파일 6개가 찍히는지 확인하세요.
 404 가 나면 1단계를 안 한 겁니다.
+
+> 코드를 고친 뒤에는 **이 셀을 다시 실행**하면 바로 반영됩니다.
+> 런타임을 다시 시작할 필요 없습니다.
 
 ---
 
