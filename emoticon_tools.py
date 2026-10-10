@@ -1062,6 +1062,122 @@ def shrink_until_under_limit(frames: List[Image.Image], path: str,
 
 # =========================================================== LangChain Tool
 
+# ====================================================== 기획 단계 (승인 게이트)
+# 예전에는 AI 가 기획안을 말하면서 동시에 이미지를 생성해버렸다. 사용자가
+# 읽기도 전에 돈과 시간이 나갔고, 마음에 안 들면 그대로 날아갔다.
+# 그래서 '계산만 하는 도구'를 따로 두고, 실제 생성은 사용자가 한 번 더
+# 말한 뒤에만 되게 막는다.
+
+_turn = 0                 # app.py 가 사용자 메시지마다 올려준다
+_plan: Optional[dict] = None
+_direct_ok = False        # 사용자가 "바로 만들어줘" 라고 한 턴인가
+
+# 기획 단계를 건너뛰라는 신호. '그냥', '바로' 단독은 너무 흔해서
+# ("그냥 귀여운 걸로") 동사까지 붙은 형태만 본다.
+SKIP_PHRASES = (
+    "바로 만들", "바로 생성", "그냥 만들", "빨리 만들", "당장 만들",
+    "묻지 말고", "설명 말고", "기획 없이", "기획 말고", "알아서 만들",
+    "확인 안 해도", "물어보지 말",
+)
+
+
+def mark_user_turn(text: str = "") -> None:
+    """
+    app.py 가 사용자 메시지를 받을 때마다 한 번 부른다.
+
+    '기획안을 보여준 턴'과 '사용자가 답한 턴'을 구분하려면 턴 번호가 필요하다.
+    이게 없으면 AI 가 같은 턴에 기획과 생성을 몰아서 해버리는 걸 막을 수 없다.
+    """
+    global _turn, _direct_ok, _plan
+    _turn += 1
+    _direct_ok = any(p in text for p in SKIP_PHRASES)
+
+
+def _size_outlook(n_frames: int) -> str:
+    """프레임 수로 용량 전망을 말해준다 (360x360 실측 기준)."""
+    if n_frames <= 12:
+        return "용량 여유 있음"
+    if n_frames <= 15:
+        return "용량 빠듯함 (색이 조금 깎일 수 있음)"
+    return ("용량 초과 위험 — 색을 많이 깎거나 카카오 전용이 됩니다. "
+            "12프레임 이하를 권합니다")
+
+
+@tool(parse_docstring=True)
+def plan_emoticon(
+    frame_count: int,
+    pose_spread: Literal["narrow", "wide"] = "narrow",
+    effect: Literal["none", "heart", "sparkle", "tear",
+                    "sweat", "anger", "note"] = "none",
+    overlay_text: str = "",
+) -> str:
+    """이모티콘을 만들기 전에 규모와 위험을 계산한다. 이미지는 만들지 않는다.
+
+    제작 요청을 받으면 '반드시 이것을 먼저' 호출한다. 그림을 그리지 않으므로
+    즉시 끝난다. 돌려받은 숫자를 바탕으로 기획안을 한국어로 직접 써서
+    사용자에게 보여주고, 사용자가 좋다고 한 뒤에 create_animated_emoticon 을
+    호출한다. 이 도구는 숫자와 주의사항만 알려주며 기획 문장은 쓰지 않는다.
+
+    Args:
+        frame_count: 만들려는 프레임 수. 4에서 24 사이. 6이나 8이 기본이고, 동작이 복잡하면 12를 쓴다.
+        pose_spread: 동작이 가로로 퍼지는 정도. narrow 는 서 있거나 팔을 드는 동작, wide 는 넘어지거나 눕는 동작이다.
+        effect: 덧붙일 효과. none, heart, sparkle, tear, sweat, anger, note 중 하나.
+        overlay_text: 넣을 한글 글자. 없으면 빈 문자열.
+    """
+    global _plan
+
+    want = max(4, min(MAX_TOTAL_FRAMES, int(frame_count)))
+    sheets = plan_sheets(want, spread=pose_spread)
+    cols, rows, _size, _n = pick_layout(sheets[0], spread=pose_spread)
+    total_cells = sum(sheets)
+
+    _plan = {"turn": _turn, "frames": want, "spread": pose_spread}
+
+    lines = [
+        f"기획 계산 결과 (아직 아무것도 만들지 않았습니다)",
+        f"- 프레임 {want}장  /  {cols}x{rows} 시트 {len(sheets)}장  /  그림 생성 {len(sheets)}회",
+        f"- 예상 소요 약 {len(sheets) * 45}초",
+    ]
+    if total_cells > want:
+        lines.append(f"- {total_cells}칸 중 {want}칸 사용 ({total_cells - want}칸은 버립니다)")
+    if want != int(frame_count):
+        lines.append(f"- 요청 {frame_count}장은 범위를 벗어나 {want}장으로 맞췄습니다 (4~{MAX_TOTAL_FRAMES})")
+    lines.append(f"- {_size_outlook(want)}")
+    if pose_spread == "wide":
+        lines.append("- 가로로 퍼지는 동작이라 칸을 크게 잡습니다 (한 장에 최대 6프레임)")
+    if overlay_text:
+        lines.append(f"- 글자 '{overlay_text}' — 효과음이면 그 일이 일어나는 프레임 번호를 "
+                     f"text_from_frame 에 주세요")
+    if effect != "none":
+        lines.append(f"- 효과 '{effect}' — 중반부터 나오게 하려면 effect_from_frame 을 주세요")
+
+    lines.append("")
+    lines.append("이 숫자를 바탕으로 프레임별 자세를 한국어로 설명하고, "
+                 "사용자에게 '이대로 만들까요?' 라고 물어보세요. "
+                 "사용자가 동의하면 그때 create_animated_emoticon 을 호출하세요.")
+    return "\n".join(lines)
+
+
+def _gate_check(frame_count: int) -> Optional[str]:
+    """
+    생성을 허용할지 판단한다. 막아야 하면 사유 문자열, 괜찮으면 None.
+
+    통과 조건
+      - 사용자가 "바로 만들어줘" 류로 명시했거나
+      - plan_emoticon 이 '이전 턴'에 호출됐을 것
+        (같은 턴이면 사용자가 기획안을 아직 못 본 것이다)
+    """
+    if _direct_ok:
+        return None
+    if _plan is None:
+        return ("먼저 plan_emoticon 을 호출해 규모를 확인하고, 기획안을 사용자에게 "
+                "보여준 뒤 동의를 받으세요. 아직 아무것도 만들지 않았습니다.")
+    if _plan["turn"] >= _turn:
+        return ("기획안을 방금 만들었습니다. 사용자에게 보여주고 동의를 받은 뒤에 "
+                "다시 호출하세요. 아직 아무것도 만들지 않았습니다.")
+    return None
+
+
 @tool(parse_docstring=True)
 def create_animated_emoticon(
     character_description: str,
@@ -1099,9 +1215,14 @@ def create_animated_emoticon(
     """
     import geo_effects as gfx
 
+    global _plan
     canvas = (CANVAS, CANVAS)
     if len(frame_steps) < 2:
         return "오류: frame_steps 가 너무 적습니다. 6개 또는 8개를 주세요."
+
+    blocked = _gate_check(len(frame_steps))
+    if blocked:
+        return blocked
 
     try:
         # (1) 스프라이트 시트 1장 생성 — AI 호출은 여기 한 번뿐
@@ -1151,6 +1272,8 @@ def create_animated_emoticon(
     except Exception as exc:   # LLM이 사유를 보고 다시 시도할 수 있게 문자열로 돌려준다
         return f"이모티콘 생성 실패: {type(exc).__name__}: {exc}"
 
+    _plan = None          # 기획은 한 번 쓰면 소진. 다음 이모티콘은 다시 기획부터
+
     last_result.update(
         gif_path=GIF_PATH, webp_path=WEBP_PATH, sheet_path=SHEET_PATH,
         frames_dir=frames_dir,
@@ -1180,5 +1303,5 @@ def create_animated_emoticon(
     )
 
 
-TOOLS = [create_animated_emoticon]
+TOOLS = [plan_emoticon, create_animated_emoticon]
 TOOL_DICT = {t.name: t for t in TOOLS}
