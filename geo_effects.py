@@ -302,9 +302,13 @@ def _a(color: Tuple[int, int, int], alpha: float) -> Tuple[int, int, int, int]:
 # 각 효과는 프레임 수 n을 받아 n장의 투명 오버레이를 돌려준다.
 
 
-def _particles(n: int, count: int, canvas, draw) -> List[Image.Image]:
+def _particles(n: int, count: int, canvas, draw,
+               from_frame: int = 1) -> List[Image.Image]:
     """
     효과 6종이 공유하는 뼈대. n프레임 × count개 입자를 찍어낸다.
+
+    from_frame 은 효과가 '몇 번째 프레임부터' 나올지다 (1이면 처음부터).
+    넘어지는 동작에서 충돌 효과가 처음부터 떠 있으면 어색하다.
 
     입자 k는 자기 위상 p = (i/n + k/count) % 1 을 따라 0 -> 1 로 진행하고,
     알파는 _fade() 로 양 끝에서 0이 된다. 보이지 않는 상태에서 한 바퀴가
@@ -312,21 +316,25 @@ def _particles(n: int, count: int, canvas, draw) -> List[Image.Image]:
 
     draw(d, k, p, al) 가 입자 하나를 그린다.
     """
+    start = max(1, min(n, int(from_frame))) - 1
+    span = max(1, n - start)
     out = []
     for i in range(n):
         layer = Image.new("RGBA", canvas, (0, 0, 0, 0))
-        d = ImageDraw.Draw(layer)
-        for k in range(count):
-            p = (i / n + k / count) % 1.0
-            al = _fade(p)
-            if al >= 0.02:
-                draw(d, k, p, al)
+        if i >= start:
+            d = ImageDraw.Draw(layer)
+            j = i - start                      # 등장 이후 기준으로 위상을 다시 센다
+            for k in range(count):
+                p = (j / span + k / count) % 1.0
+                al = _fade(p)
+                if al >= 0.02:
+                    draw(d, k, p, al)
         out.append(layer)
     return out
 
 
 def fx_heart(n: int = 12, count: int = 3, anchors=None,
-             canvas=(CANVAS, CANVAS)) -> List[Image.Image]:
+             canvas=(CANVAS, CANVAS), from_frame: int = 1) -> List[Image.Image]:
     """
     설렘. 하트가 캐릭터 '양옆'에서 떠올라 흔들리며 사라진다.
 
@@ -353,11 +361,11 @@ def fx_heart(n: int = 12, count: int = 3, anchors=None,
                   fill=_a(PINK, al), outline=_a(LINE[:3], al),
                   width=max(2, int(3 * sc)))
 
-    return _particles(n, count, canvas, draw)
+    return _particles(n, count, canvas, draw, from_frame=from_frame)
 
 
 def fx_sparkle(n: int = 12, count: int = 4, anchors=None,
-               canvas=(CANVAS, CANVAS)) -> List[Image.Image]:
+               canvas=(CANVAS, CANVAS), from_frame: int = 1) -> List[Image.Image]:
     """
     최고 / 뿌듯. 반짝임이 캐릭터 '바깥쪽'에서 번쩍인다.
     (얼굴 위에 찍히지 않도록 bbox 바깥에 배치한다)
@@ -379,10 +387,11 @@ def fx_sparkle(n: int = 12, count: int = 4, anchors=None,
         d.polygon(_star_polygon(cx, cy, (9 + 16 * al) * sc),
                   fill=_a(GOLD, al), outline=_a(LINE[:3], al), width=2)
 
-    return _particles(n, min(count, len(spots)), canvas, draw)
+    return _particles(n, min(count, len(spots)), canvas, draw,
+                      from_frame=from_frame)
 
 
-def fx_tear(n: int = 12, anchors=None, canvas=(CANVAS, CANVAS)) -> List[Image.Image]:
+def fx_tear(n: int = 12, anchors=None, canvas=(CANVAS, CANVAS), from_frame: int = 1) -> List[Image.Image]:
     """슬픔. 양쪽 눈에서 눈물이 흐른다."""
     BLUE = (120, 196, 255)
     eyes = (_pick(anchors, "left_eye", canvas), _pick(anchors, "right_eye", canvas))
@@ -393,10 +402,10 @@ def fx_tear(n: int = 12, anchors=None, canvas=(CANVAS, CANVAS)) -> List[Image.Im
         d.polygon(_drop_polygon(ex, ey + 76 * sc * p, (9 + 3 * p) * sc),
                   fill=_a(BLUE, al ** 0.5), outline=_a(LINE[:3], al ** 0.5), width=2)
 
-    return _particles(n, 2, canvas, draw)
+    return _particles(n, 2, canvas, draw, from_frame=from_frame)
 
 
-def fx_sweat(n: int = 12, anchors=None, canvas=(CANVAS, CANVAS)) -> List[Image.Image]:
+def fx_sweat(n: int = 12, anchors=None, canvas=(CANVAS, CANVAS), from_frame: int = 1) -> List[Image.Image]:
     """당황. 땀방울이 머리 양옆에서 튀어 날아간다."""
     BLUE = (150, 210, 255)
     srcs = ((_pick(anchors, "head_tr", canvas), 1),
@@ -413,10 +422,10 @@ def fx_sweat(n: int = 12, anchors=None, canvas=(CANVAS, CANVAS)) -> List[Image.I
         d.polygon(_drop_polygon(cx, cy, (10 - 2 * p) * sc),
                   fill=_a(BLUE, al), outline=_a(LINE[:3], al), width=2)
 
-    return _particles(n, 2, canvas, draw)
+    return _particles(n, 2, canvas, draw, from_frame=from_frame)
 
 
-def fx_anger(n: int = 12, anchors=None, canvas=(CANVAS, CANVAS)) -> List[Image.Image]:
+def fx_anger(n: int = 12, anchors=None, canvas=(CANVAS, CANVAS), from_frame: int = 1) -> List[Image.Image]:
     """화남. 김이 머리 위로 뿜어져 올라간다. (양옆 2곳 × 2덩이 = 입자 4개)"""
     GRAY = (228, 228, 236)
     srcs = (_pick(anchors, "head_tl", canvas), _pick(anchors, "head_tr", canvas))
@@ -434,11 +443,11 @@ def fx_anger(n: int = 12, anchors=None, canvas=(CANVAS, CANVAS)) -> List[Image.I
         d.ellipse([cx - r, cy - r * 0.78, cx + r, cy + r * 0.78],
                   fill=_a(GRAY, al * 0.92), outline=_a(LINE[:3], al * 0.74), width=2)
 
-    return _particles(n, 4, canvas, draw)
+    return _particles(n, 4, canvas, draw, from_frame=from_frame)
 
 
 def fx_note(n: int = 12, count: int = 2, anchors=None,
-            canvas=(CANVAS, CANVAS)) -> List[Image.Image]:
+            canvas=(CANVAS, CANVAS), from_frame: int = 1) -> List[Image.Image]:
     """신남. 음표가 캐릭터 오른쪽 위 허공으로 떠오른다."""
     PURPLE = (160, 128, 255)
     ax, ay = _pick(anchors, "float_tr", canvas)
@@ -455,20 +464,24 @@ def fx_note(n: int = 12, count: int = 2, anchors=None,
         _note_shape(d, ax + sway * math.sin(p * 4 + k * 2), ay - rise * p,
                     (15 + 4 * p) * sc, _a(PURPLE, al), _a(LINE[:3], al), 2)
 
-    return _particles(n, count, canvas, draw)
+    return _particles(n, count, canvas, draw, from_frame=from_frame)
 
 
 def fx_text(text: str, n: int = 12, anchors=None, canvas=(CANVAS, CANVAS),
             size: int = 0, color=(255, 255, 255), bob: float = 10,
-            place: str = "above") -> List[Image.Image]:
+            place: str = "above", from_frame: int = 1) -> List[Image.Image]:
     """
-    글자 효과. 'ㅋㅋㅋ', 'Zzz', '?', '!', '고마워' 등.
+    글자 효과. 'ㅋㅋㅋ', 'Zzz', '?', '!', '고마워', '우당탕' 등.
 
     AI에게 글자를 그리게 하면 획이 깨지지만, 폰트로 직접 쓰면 100% 정확하다.
     다크모드 대응 흰 테두리(stroke)도 여기서 정확히 넣는다.
 
     size=0 이면 '남은 여백에 들어가는 최대 크기'를 스스로 계산한다.
     place: "above"(머리 위) | "below"(발 아래)
+
+    from_frame 은 글자가 '몇 번째 프레임부터' 나올지다 (1이면 처음부터).
+    '우당탕' 같은 효과음이 넘어지기도 전부터 떠 있으면 어색하다.
+    중간에 등장할 때는 살짝 커졌다 제자리로 오는 연출이 자동으로 붙는다.
     """
     cw, ch = canvas
     ax, ay = _pick(anchors, "above_head" if place == "above" else "below", canvas)
@@ -487,13 +500,25 @@ def fx_text(text: str, n: int = 12, anchors=None, canvas=(CANVAS, CANVAS),
     font = load_font(size)
     stroke = max(3, size // 12)
 
+    start = max(1, min(n, int(from_frame))) - 1
+
     out = []
     for i in range(n):
         layer = Image.new("RGBA", canvas, (0, 0, 0, 0))
+        if i < start:
+            out.append(layer)          # 아직 등장 전
+            continue
+
         d = ImageDraw.Draw(layer)
-        p = i / n
+        j = i - start
+        p = j / max(1, n - start)
         s = 1 + 0.10 * math.sin(2 * math.pi * p)
         dy = bob * math.sin(2 * math.pi * p)
+
+        # 중간에 등장하면 '뿅' 하고 튀어나오게 — 첫 두 프레임만 크기를 흔든다
+        if start > 0 and j < 2:
+            s *= (1.35, 0.95)[j]
+
         d.text((ax, ay + dy), text, font=font, anchor="mm",
                fill=color + (255,), stroke_width=stroke, stroke_fill=LINE)
         if abs(s - 1) > 1e-6:

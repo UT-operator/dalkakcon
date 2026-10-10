@@ -1070,6 +1070,8 @@ def create_animated_emoticon(
     effect: Literal["none", "heart", "sparkle", "tear",
                     "sweat", "anger", "note"] = "none",
     overlay_text: str = "",
+    text_from_frame: int = 1,
+    effect_from_frame: int = 1,
     speed_ms: int = 110,
     hold_last_ms: int = 300,
     quality: Literal["low", "medium", "high"] = "high",
@@ -1088,6 +1090,8 @@ def create_animated_emoticon(
         frame_steps: 프레임별 자세를 묘사한 영문 문장 리스트. 최소 4개에서 최대 24개까지 가능하다. 6개면 가장 빠르고 싸며(생성 1회, 약 45초), 12개는 2회, 24개는 3~4회가 든다. 사용자가 프레임 수를 말하지 않으면 6개 또는 8개로 한다. 동작이 복잡하거나 사용자가 부드럽게 해달라고 하면 12개 이상으로 늘린다. 15개를 넘으면 파일이 커져서 카카오 외 플랫폼 기준을 넘길 수 있다. 각 문장은 '한 장의 정지 그림'을 묘사하며 움직임을 설명하지 않는다. 동작이 자연스럽게 이어지도록 순서대로 쓰고, 반복 재생되므로 첫 번째와 마지막은 같은 기본 자세로 둔다. 마지막 자세가 이모티콘샵 썸네일이 되므로 캐릭터를 가장 잘 보여주는 자세로 한다. 효과나 글자는 쓰지 않는다. 예시는 front paw down at its side with a calm smile / front paw lifted to chest height / front paw raised high beside the head with an open smile 처럼 쓴다.
         pose_spread: 동작이 가로로 얼마나 퍼지는지 고른다. narrow 는 서 있거나 팔을 드는 것처럼 세로로 길쭉한 동작이다. wide 는 넘어지기, 눕기, 구르기, 대자로 뻗기처럼 가로로 넓게 퍼지는 동작이다. wide 를 고르면 칸을 크게 잡아 그림이 잘리지 않는다. 대신 프레임 수가 최대 6개로 줄어든다.
         effect: 덧붙일 효과를 고른다. none 은 효과 없음이다. heart 는 하트가 떠올라 설렘에 쓴다. sparkle 은 반짝임으로 최고나 뿌듯함에 쓴다. tear 는 눈물로 슬픔에 쓴다. sweat 는 땀방울로 당황에 쓴다. anger 는 김이 뿜어져 화남에 쓴다. note 는 음표가 떠올라 신남에 쓴다.
+        text_from_frame: 글자가 몇 번째 프레임부터 나올지 정한다. 1이면 처음부터 끝까지 떠 있다. 우당탕 쿵 탁 같은 효과음은 그 일이 실제로 일어나는 프레임 번호를 준다. 예를 들어 6프레임 중 4번째에서 바닥에 부딪히면 4를 준다. 고마워 안녕 같은 대사는 1로 둔다.
+        effect_from_frame: 효과가 몇 번째 프레임부터 나올지 정한다. 1이면 처음부터다. 하트나 반짝임은 감정이 드러나는 중반부터 나오는 것이 자연스럽다.
         overlay_text: 이모티콘에 넣을 짧은 한글 글자. 필요 없으면 빈 문자열로 둔다. ㅋㅋㅋ 고마워 미안 같이 짧을수록 좋다. 글자는 폰트로 정확히 찍히므로 그림에 맡기지 않는다.
         speed_ms: 프레임 하나의 재생 시간을 밀리초로 준다. 80에서 150 사이를 권장하고 작을수록 빠르다.
         hold_last_ms: 마지막 프레임에서 더 머무는 시간을 밀리초로 준다. 동작이 끝나고 잠깐 쉬는 느낌을 준다. 0이면 쉬지 않는다.
@@ -1123,10 +1127,12 @@ def create_animated_emoticon(
             anchors = gfx.anchors_from_bbox(box, canvas)
             if effect != "none":
                 frames = gfx.composite(frames, gfx.EFFECTS[effect](
-                    n=len(frames), anchors=anchors, canvas=canvas))
+                    n=len(frames), anchors=anchors, canvas=canvas,
+                    from_frame=effect_from_frame))
             if overlay_text:
                 frames = gfx.composite(frames, gfx.fx_text(
-                    overlay_text, n=len(frames), anchors=anchors, canvas=canvas))
+                    overlay_text, n=len(frames), anchors=anchors, canvas=canvas,
+                    from_frame=text_from_frame))
 
         # (7) 재생 시간 — 마지막 프레임에서 잠깐 쉰다
         durations = [speed_ms] * len(frames)
@@ -1162,8 +1168,12 @@ def create_animated_emoticon(
         f"- 스프라이트 시트 {len(grids)}장({' + '.join(grids)})을 생성해 "
         f"{len(frames)}프레임으로 분할{dropped}\n"
         f"- 재생 {total_s:.1f}초 (프레임당 {speed_ms}ms, 마지막 {durations[-1]}ms)\n"
-        + (f"- 효과: {effect}\n" if effect != "none" else "")
-        + (f"- 글자: {overlay_text}\n" if overlay_text else "")
+        + (f"- 효과: {effect}"
+           + (f" ({effect_from_frame}번 프레임부터)" if effect_from_frame > 1 else "")
+           + "\n" if effect != "none" else "")
+        + (f"- 글자: {overlay_text}"
+           + (f" ({text_from_frame}번 프레임부터)" if text_from_frame > 1 else "")
+           + "\n" if overlay_text else "")
         + f"- 규격: {CANVAS}x{CANVAS}px, 투명 배경, GIF {gif_size/1024:.0f}KB\n"
         + "".join(f"- 주의: {w}\n" for w in warns)
         + "화면 왼쪽 사이드바에서 미리보기와 다운로드가 가능하다고 사용자에게 안내하세요."
