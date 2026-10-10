@@ -304,14 +304,56 @@ CYCLIC = {"breathe", "bounce", "nod", "rock", "shake", "float",
           "slide", "spin_wobble"}
 
 
+def motion_extent(name: str, **kwargs) -> dict:
+    """
+    그 모션이 캐릭터를 '얼마나 벗어나게' 하는지 미리 계산한다.
+
+    왜 필요한가:
+      점프는 캐릭터를 위로 95px 올린다. 글자 자리를 머리 위에 비워뒀는데
+      그대로 점프시키면 글자와 부딪히거나 캔버스 밖으로 잘린다.
+      그리기 전에 필요한 여백을 알아야 배치를 맞출 수 있다.
+
+    돌려주는 값 (단위: 픽셀, scale 은 배율)
+      up / down / left / right : 각 방향으로 최대 얼마나 벗어나는가
+      scale                    : 늘어남과 '회전'까지 포함한 최대 외곽 배율
+
+    회전을 꼭 넣어야 한다. 한 변 S 인 그림을 th 만큼 돌리면 외곽 사각형이
+    S*(|cos th| + |sin th|) 로 넓어진다. 26도면 34% 커진다.
+    (이걸 빠뜨려서 rock 과 spin_wobble 이 캔버스 밖으로 잘렸다)
+    """
+    params = MOTIONS[name](**kwargs)
+    dys = [p.get("dy", 0.0) for p in params]
+    dxs = [p.get("dx", 0.0) for p in params]
+
+    spans = []
+    for p in params:
+        th = math.radians(p.get("rot", 0.0))
+        spread = abs(math.cos(th)) + abs(math.sin(th))
+        spans.append(max(p.get("sx", 1.0), p.get("sy", 1.0)) * spread)
+
+    return {
+        "up": max(0.0, -min(dys)),
+        "down": max(0.0, max(dys)),
+        "left": max(0.0, -min(dxs)),
+        "right": max(0.0, max(dxs)),
+        "scale": max(spans),
+    }
+
+
 def apply_motion(base: Image.Image, name: str, base_ms: int = 80,
-                 **kwargs) -> Tuple[List[Image.Image], List[int]]:
+                 scale: float = 1.0, **kwargs) -> Tuple[List[Image.Image], List[int]]:
     """
     그림 1장 + 모션 이름 → (프레임 리스트, 프레임별 재생시간 ms)
 
+    scale : 이동량(dx, dy)만 줄이거나 키운다. 여백이 모자랄 때 움직임을
+            작게 만들어 캔버스 밖으로 안 나가게 하는 용도.
+            눌림·회전은 건드리지 않아 동작의 느낌은 유지된다.
     재생시간은 카카오 규격(0.05~2.0초)으로 잘라낸다.
     """
     params = MOTIONS[name](**kwargs)
+    if scale != 1.0:
+        params = [dict(p, dx=p.get("dx", 0.0) * scale, dy=p.get("dy", 0.0) * scale)
+                  for p in params]
     frames = [transform_frame(base, **p) for p in params]
     durations = [int(min(2000, max(50, base_ms * p.get("hold", 1.0))))
                  for p in params]

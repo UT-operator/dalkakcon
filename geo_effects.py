@@ -50,7 +50,9 @@ def anchors_from_bbox(bbox, canvas=(CANVAS, CANVAS)) -> Dict[str, Tuple[int, int
         return (max(0, min(cw, int(p[0]))), max(0, min(ch, int(p[1]))))
 
     return {
-        "above_head": clamp((cx, y0 - h * 0.11)),
+        # 머리 위 '빈 공간의 한가운데'. 글자가 여기 중앙정렬로 놓이므로
+        # 캐릭터 바로 위(y0 - 조금)로 잡으면 글자 아랫부분이 귀를 덮는다.
+        "above_head": clamp((cx, max(14, y0 * 0.5))),
         "below":      clamp((cx, y1 + h * 0.10)),
         "chest":      clamp((cx, y0 + h * 0.66)),
         "left_eye":   clamp((x0 + w * 0.30, y0 + h * 0.46)),
@@ -296,15 +298,26 @@ def _particles(n: int, count: int, canvas, draw) -> List[Image.Image]:
 
 def fx_heart(n: int = 12, count: int = 3, anchors=None,
              canvas=(CANVAS, CANVAS)) -> List[Image.Image]:
-    """설렘. 하트가 가슴께에서 떠올라 흔들리며 사라진다."""
+    """
+    설렘. 하트가 캐릭터 '양옆'에서 떠올라 흔들리며 사라진다.
+
+    가슴 높이에서 똑바로 올리면 얼굴 한가운데를 가로지른다.
+    (머리만 있는 캐릭터면 가슴 좌표 자체가 얼굴 안이다)
+    그래서 실루엣 바깥에서 띄운다.
+    """
     PINK = (255, 96, 128)
-    ax, ay = _pick(anchors, "chest", canvas)
+    x0, y0, x1, y1 = (anchors or default_anchors(canvas))["_bbox"]
     sc = _scale_of(anchors)
-    rise = max(40.0, ay - _pick(anchors, "above_head", canvas)[1] + 40 * sc)
+    pad = 18 * sc
+    start_y = y0 + (y1 - y0) * 0.55
+    rise = max(50.0, start_y - 16)
+    sides = [x0 - pad, x1 + pad]
 
     def draw(d, k, p, al):
-        cx = ax + (k - (count - 1) / 2) * 34 * sc + 11 * sc * math.sin(p * 5 + k)
-        d.polygon(_heart_polygon(cx, ay - rise * p, (13 + 9 * p) * sc),
+        base_x = sides[k % 2]
+        drift = (10 + 6 * (k // 2)) * sc * math.sin(p * 4 + k)
+        cx = base_x + drift * (1 if k % 2 else -1)
+        d.polygon(_heart_polygon(cx, start_y - rise * p, (12 + 8 * p) * sc),
                   fill=_a(PINK, al), outline=_a(LINE[:3], al),
                   width=max(2, int(3 * sc)))
 
@@ -409,10 +422,12 @@ def fx_text(text: str, n: int = 12, anchors=None, canvas=(CANVAS, CANVAS),
     cw, ch = canvas
     ax, ay = _pick(anchors, "above_head" if place == "above" else "below", canvas)
 
-    # 여백에 맞는 글자 크기를 정한다 (얼굴을 덮지 않게)
+    # 여백에 맞는 글자 크기를 정한다.
+    # 글자는 ay 를 '중심'으로 그려지므로 위아래로 절반씩 퍼진다.
+    # 렌더 높이의 절반은 대략 size*0.62 (글자높이 + 외곽선).
     if size <= 0:
         room = ay if place == "above" else (ch - ay)
-        size = int(max(22, min(72, room * 1.25)))
+        size = int(max(20, min(76, (room - 8) / 0.62)))
 
     font = load_font(size)
     stroke = max(3, size // 12)

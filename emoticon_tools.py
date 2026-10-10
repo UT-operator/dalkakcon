@@ -71,13 +71,19 @@ STYLE_SUFFIX = (
 _reference_image: Optional[bytes] = None
 _reference_mime: str = "image/png"
 
+# 기준 원화 캐시. 대화 중 이모티콘을 여러 개 만들어도 같은 캐릭터가 나오게 한다.
+# (없으면 매번 새 캐릭터가 생겨서 세트로 쓸 수 없다)
+_base_cache: Optional[Image.Image] = None
+
 # 마지막 생성 결과 메타데이터 (UI 표시용)
 last_result: dict = {}
 
 
 def set_reference_image(data: Optional[bytes], mime: str = "image/png") -> None:
-    """app.py가 사용자 업로드 이미지를 등록한다."""
-    global _reference_image, _reference_mime
+    """app.py가 사용자 업로드 이미지를 등록한다. 바뀌면 기준 원화 캐시를 버린다."""
+    global _reference_image, _reference_mime, _base_cache
+    if data != _reference_image:
+        _base_cache = None            # 다른 캐릭터이므로 원화를 다시 만들어야 한다
     _reference_image = data
     _reference_mime = mime or "image/png"
 
@@ -158,6 +164,19 @@ def build_base_sheet(character_description: str, quality: str = "low") -> Image.
     img = Image.open(io.BytesIO(raw)).convert("RGBA")
     _save_png(img, BASE_PATH)
     return img
+
+
+def get_base_sheet(character_description: str, quality: str = "low") -> Image.Image:
+    """
+    기준 원화를 가져온다. 처음 한 번만 만들고 이후에는 재사용한다.
+
+    대화 중 이모티콘을 여러 개 만들 때 매번 새로 생성하면 캐릭터가 조금씩
+    달라져서 세트로 쓸 수 없다. 업로드 이미지가 바뀌면 캐시는 자동으로 버려진다.
+    """
+    global _base_cache
+    if _base_cache is None:
+        _base_cache = build_base_sheet(character_description, quality=quality)
+    return _base_cache
 
 
 # ----------------------------------------- (2) 프레임 N장 병렬 생성
@@ -434,6 +453,70 @@ def fit_art_set(arts: dict, canvas=(CANVAS, CANVAS), margin: float = 0.04,
     return out
 
 
+def fit_art_for_motion(art: Image.Image, motion: str, canvas=(CANVAS, CANVAS),
+                       margin: float = 0.045, reserve_top: float = 0.0,
+                       max_up_ratio: float = 0.22):
+    """
+    '모션이 움직일 공간'과 '글자·효과 자리'를 먼저 빼고 캐릭터를 배치한다.
+
+    왜 필요한가:
+      점프는 캐릭터를 95px 위로 올리고, 낙하는 110px 올린다. 캐릭터를 먼저
+      크게 배치해놓고 모션을 걸면 머리가 캔버스 밖으로 잘리거나 글자와 겹친다.
+
+    처리 순서
+      1. 모션이 필요한 여백(위/아래/좌우)과 늘어남 배율을 미리 구한다
+      2. 위로 가는 양이 캔버스의 max_up_ratio 를 넘으면 '움직임'을 줄인다
+         (캐릭터를 더 줄이는 것보다 낫다 - 캐릭터가 너무 작아지면 안 예쁘다)
+      3. 남은 공간에 캐릭터를 넣고 바닥 쪽에 붙인다
+
+    돌려주는 값: (배치된 그림, 캐릭터 bbox, 모션에 적용할 배율)
+    """
+    import math
+
+    import geo_motion as gm
+
+    w, h = _canvas_wh(canvas)
+    params = gm.MOTIONS[motion]()
+    mx, my = w * margin, h * margin
+
+    # 위로 가는 양을 캔버스의 max_up_ratio 로 제한 (넘치면 움직임을 줄인다)
+    up_raw = max(0.0, -min(p.get("dy", 0.0) for p in params))
+    mscale = min(1.0, h * max_up_ratio / up_raw) if up_raw > 1e-6 else 1.0
+
+    down = max(0.0, max(p.get("dy", 0.0) for p in params)) * mscale
+    bottom = h - my - down                      # 캐릭터 발바닥이 놓일 높이
+    top_limit = my + h * reserve_top            # 그 위는 글자·효과 자리
+    room = bottom - top_limit
+
+    # 프레임마다 '그 순간' 필요한 크기를 따로 계산해 가장 빡빡한 것에 맞춘다.
+    # 방향별 최댓값을 따로 구해서 곱하면(늘어남 최대 x 높이 최대) 실제로는
+    # 동시에 일어나지 않는 상황까지 피하느라 캐릭터가 쓸데없이 작아진다.
+    side = float(min(room, w - 2 * mx))
+    for p in params:
+        th = math.radians(p.get("rot", 0.0))
+        spread = abs(math.cos(th)) + abs(math.sin(th))
+        sy = max(1e-3, p.get("sy", 1.0) * spread)
+        sx = max(1e-3, p.get("sx", 1.0) * spread)
+        up_f = max(0.0, -p.get("dy", 0.0) * mscale)
+        dx_f = abs(p.get("dx", 0.0)) * mscale
+        side = min(side, (room - up_f) / sy)                  # 위로 안 잘리게
+        side = min(side, 2 * (w / 2 - mx - dx_f) / sx)        # 좌우로 안 잘리게
+
+    target = int(max(32, side))
+
+    box = robust_bbox(art)
+    if box is None:
+        sheet = art.resize((w, h), Image.LANCZOS)
+        return sheet, (0, 0, w, h), mscale
+
+    src_side = max(box[2] - box[0], box[3] - box[1])
+    center = ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
+    ox = (w - target) // 2
+    oy = int(bottom) - target
+    sheet = _place(art, center, src_side, target, (ox, oy), (w, h))
+    return sheet, (robust_bbox(sheet) or (ox, oy, ox + target, oy + target)), mscale
+
+
 # ----------------------------------------- (6) 무한 루핑 시퀀스
 
 def build_loop_sequence(frames: List[Image.Image], mode: str = "pingpong") -> List[Image.Image]:
@@ -602,94 +685,99 @@ def shrink_until_under_limit(frames: List[Image.Image], path: str,
 @tool(parse_docstring=True)
 def create_animated_emoticon(
     character_description: str,
-    frame_prompts: List[str],
-    loop_mode: Literal["pingpong", "cycle"] = "pingpong",
-    frame_duration_ms: int = 150,
+    pose: str,
+    motion: Literal["breathe", "bounce", "nod", "rock", "shake", "float",
+                    "slide", "spin_wobble", "jump", "drop", "pop",
+                    "zoom_punch"] = "bounce",
+    effect: Literal["none", "heart", "sparkle", "tear",
+                    "sweat", "anger", "note"] = "none",
     overlay_text: str = "",
+    speed_ms: int = 80,
     quality: Literal["low", "medium", "high"] = "low",
 ) -> str:
-    """기획안을 받아 실제로 움직이는 이모티콘 파일(GIF/WebP)을 생성한다.
+    """움직이는 이모티콘 파일(GIF)을 실제로 만든다.
 
     사용자가 이모티콘 제작을 명확히 요청했을 때만 호출한다. 기획안만 보여달라고 하면
-    호출하지 말고 대화로만 답한다. 모든 프롬프트 인자는 반드시 영문으로 작성한다.
+    호출하지 말고 대화로만 답한다. character_description 과 pose 는 반드시 영문으로 쓴다.
+
+    AI는 '포즈 한 장'만 그리고, 움직임과 효과는 수식과 도형으로 만든다. 그래서
+    생성이 빠르고 저렴하다. 같은 대화 안에서 여러 번 호출하면 캐릭터가 유지된다.
 
     Args:
-        character_description: 캐릭터의 외형, 색상, 분위기를 묘사한 영문 문장. 사용자가 이미지를 업로드했다면 그 캐릭터를 유지하면서 보강할 설명을 쓴다.
-        frame_prompts: 프레임별 포즈와 표정을 묘사한 영문 문장 리스트로 3~4개를 권장한다. 시작 동작, 핵심 액션, 마무리 동작 순서로 서로 자연스럽게 이어지게 쓴다. 배경이나 화면 구도는 쓰지 않고 포즈와 표정의 변화만 쓴다. 예시는 standing still with a calm smile / crouching slightly preparing to jump / jumping high with arms raised and sparkles 처럼 쓴다.
-        loop_mode: pingpong은 1-2-3-2-1처럼 왕복해 끊김 없이 반복하므로 점프나 손 흔들기에 쓴다. cycle은 걷기처럼 동작 자체가 순환할 때 쓴다.
-        frame_duration_ms: 프레임 1장당 재생 시간을 밀리초로 지정한다. 100에서 250 사이를 권장한다.
-        overlay_text: 이모티콘 안에 글자를 넣고 싶을 때만 채운다. 짧은 단어가 좋고 필요 없으면 빈 문자열로 둔다.
-        quality: 이미지 생성 품질로 low는 빠르고 저렴하다. 사용자가 더 높은 품질을 요청하면 medium이나 high를 쓴다.
+        character_description: 캐릭터의 외형, 색상, 분위기를 묘사한 영문 문장. 사용자가 이미지를 올렸다면 그 캐릭터를 유지하면서 보강할 설명을 쓴다. 대화 중 한 번만 쓰이고 이후에는 처음 만든 캐릭터가 재사용된다.
+        pose: 이 이모티콘의 포즈와 표정을 묘사한 영문 문장. 움직임은 쓰지 않고 '한 장의 그림'으로 묘사한다. 예를 들어 giving a thumbs up with a proud smile 처럼 쓴다. 효과나 글자는 넣지 않는다. 그건 따로 처리된다.
+        motion: 어떻게 움직일지 고른다. breathe 는 거의 멈춘 듯 숨만 쉬고 피곤함이나 잔잔한 감정에 쓴다. bounce 는 통통 튀며 가장 무난하다. nod 는 끄덕임으로 알았어나 고마워에 쓴다. rock 은 좌우로 갸우뚱한다. shake 는 부들부들 떨며 화남이나 당황에 쓴다. float 는 둥둥 떠다니며 멍때림에 쓴다. slide 는 좌우로 미끄러진다. spin_wobble 은 크게 갸우뚱하며 모르겠다는 느낌이다. jump 는 높이 점프하며 신남이나 축하에 쓴다. drop 은 위에서 뚝 떨어진다. pop 은 뿅 나타났다 사라진다. zoom_punch 는 확 커졌다 돌아오며 좋아나 최고 같은 강조에 쓴다.
+        effect: 덧붙일 효과를 고른다. none 은 효과 없음이다. heart 는 하트가 떠올라 설렘에 쓴다. sparkle 은 반짝임으로 최고나 뿌듯함에 쓴다. tear 는 눈물로 슬픔에 쓴다. sweat 는 땀방울로 당황에 쓴다. anger 는 김이 뿜어져 화남에 쓴다. note 는 음표가 떠올라 신남에 쓴다.
+        overlay_text: 이모티콘에 넣을 짧은 한글 글자. 필요 없으면 빈 문자열로 둔다. ㅋㅋㅋ 고마워 미안 같이 짧을수록 좋다. 글자는 폰트로 정확히 찍히므로 AI에게 맡기지 않는다.
+        speed_ms: 프레임 하나의 기준 재생 시간을 밀리초로 준다. 60에서 120 사이를 권장하고 작을수록 빠르다.
+        quality: 그림 품질이다. low 는 빠르고 저렴하다. 사용자가 더 좋은 품질을 원하면 medium 이나 high 를 쓴다.
     """
-    if not frame_prompts:
-        return "오류: frame_prompts가 비어 있습니다. 프레임 묘사를 3~4개 만들어 다시 호출하세요."
+    import geo_effects as gfx
+    import geo_motion as gmo
 
-    frame_prompts = frame_prompts[:8]   # 핑퐁까지 고려해 원본 프레임은 8장까지만
-
+    canvas = (CANVAS, CANVAS)
     try:
-        # (1) 기준 원화
-        base = build_base_sheet(character_description, quality=quality)
+        # (1) 기준 원화 — 대화 중 한 번만 만들고 재사용해 캐릭터를 고정한다
+        base = get_base_sheet(character_description, quality=quality)
 
-        # (2) 프레임 병렬 생성 — 한 장이 실패해도 나머지는 살린다
-        raw_frames, failures = generate_frames(base, frame_prompts, quality=quality)
-        if not raw_frames:
-            reasons = "; ".join(e for _, e in failures) or "알 수 없음"
-            return f"오류: 프레임 생성에 모두 실패했습니다. 사유: {reasons}"
+        # (2) 이 이모티콘의 포즈 한 장 (AI 호출은 여기까지)
+        art = generate_pose(_to_png_bytes(base), pose, quality=quality, name="pose")
+        _save_png(art, FRAME_PATH_FMT.format(1))
 
-        # (3) 투명 배경 안정화
-        cleaned = [stabilize_alpha(f) for f in raw_frames]
+        # (3) 투명 배경 정리
+        clean = stabilize_alpha(art)
 
-        # (4)+(5) 공통 정렬 + 규격. 글자가 있으면 위쪽을 비워 얼굴을 안 덮게 한다
-        reserve = 0.20 if overlay_text else 0.0
-        sized = fit_frames_to_canvas(cleaned, canvas=CANVAS, reserve_top=reserve)
+        # (4) 모션이 움직일 공간과 글자 자리를 빼고 배치
+        reserve = 0.20 if overlay_text else (0.08 if effect != "none" else 0.0)
+        sheet, box, mscale = fit_art_for_motion(clean, motion, canvas=canvas,
+                                                reserve_top=reserve)
+        sheet = fill_interior_holes(sheet)
 
-        # (3-b) 내부 구멍 메우기 (360px로 줄인 뒤에 해야 flood fill이 싸다)
-        sized = [fill_interior_holes(f) for f in sized]
+        # (5) 움직임 — AI 아님. 수식이 만든다
+        frames, durations = gmo.apply_motion(sheet, motion, base_ms=speed_ms,
+                                             scale=mscale)
 
-        # (6) 루프 시퀀스 — 대표 프레임으로 끝맺는다
-        seq = build_loop_sequence(sized, mode=loop_mode)
-
-        # (6-b) 글자는 AI가 아니라 Pillow가 쓴다. 획이 깨지지 않고 위치가 정확하다.
+        # (6) 효과와 글자 — Pillow가 캐릭터 위치에 맞춰 직접 그린다
+        anchors = gfx.anchors_from_bbox(box, canvas)
+        if effect != "none":
+            frames = gfx.composite(frames, gfx.EFFECTS[effect](
+                n=len(frames), anchors=anchors, canvas=canvas))
         if overlay_text:
-            import geo_effects as gfx
-            box = union_bbox(sized)
-            if box:
-                anchors = gfx.anchors_from_bbox(box, (CANVAS, CANVAS))
-                overlay = gfx.fx_text(overlay_text, n=len(seq), anchors=anchors,
-                                      canvas=(CANVAS, CANVAS))
-                seq = gfx.composite(seq, overlay)
+            frames = gfx.composite(frames, gfx.fx_text(
+                overlay_text, n=len(frames), anchors=anchors, canvas=canvas))
 
-        # (7) 저장
-        gif_size, note = shrink_until_under_limit(seq, GIF_PATH, frame_duration_ms)
-        webp_size = save_webp(seq, WEBP_PATH, frame_duration_ms)
-        if failures:
-            note = (note + "; " if note else "") + \
-                   f"프레임 {len(failures)}장 실패({', '.join(str(i) for i, _ in failures)}번)"
+        # (7) 저장 — GIF + 번호 붙인 PNG 프레임(카카오 WebP Animator 용)
+        gif_size, note = shrink_until_under_limit(frames, GIF_PATH, durations,
+                                                  limit=SAFE_MAX_BYTES)
+        webp_size = save_webp(frames, WEBP_PATH, durations)
 
-    except Exception as exc:   # LLM이 이유를 보고 다시 시도할 수 있게 문자열로 돌려준다
+        frames_dir = os.path.join(OUT_DIR, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        for i, f in enumerate(frames, 1):
+            f.save(os.path.join(frames_dir, f"{i:02d}.png"))
+
+    except Exception as exc:   # LLM이 사유를 보고 다시 시도할 수 있게 문자열로 돌려준다
         return f"이모티콘 생성 실패: {type(exc).__name__}: {exc}"
 
     last_result.update(
-        gif_path=GIF_PATH,
-        webp_path=WEBP_PATH,
-        base_path=BASE_PATH,
-        frame_paths=[FRAME_PATH_FMT.format(i + 1) for i in range(len(raw_frames))],
-        unique_frames=len(raw_frames),
-        total_frames=len(seq),
-        loop_mode=loop_mode,
-        duration_ms=frame_duration_ms,
-        gif_size=gif_size,
-        webp_size=webp_size,
+        gif_path=GIF_PATH, webp_path=WEBP_PATH, base_path=BASE_PATH,
+        frames_dir=frames_dir,
+        frame_paths=[FRAME_PATH_FMT.format(1)],   # AI가 그린 원본 1장
+        unique_frames=1, total_frames=len(frames),
+        loop_mode=motion, effect=effect, duration_ms=speed_ms,
+        motion_scale=round(mscale, 2), gif_size=gif_size, webp_size=webp_size,
     )
 
-    spec_ok = "충족" if gif_size <= MAX_BYTES else "초과"
+    total_s = sum(durations) / 1000
+    damped = "" if mscale > 0.99 else f" (여백에 맞춰 움직임을 {mscale:.0%}로 줄임)"
     return (
         f"이모티콘 생성 완료!\n"
-        f"- 원본 프레임 {len(raw_frames)}장 -> {loop_mode} 적용 후 총 {len(seq)}프레임\n"
-        f"- 규격: {CANVAS}x{CANVAS}px, 투명 배경, 무한 반복(loop=0), "
-        f"프레임당 {frame_duration_ms}ms\n"
-        f"- GIF {gif_size/1024:.0f}KB (2MB 제한 {spec_ok}), WebP {webp_size/1024:.0f}KB\n"
-        f"- 저장 위치: {GIF_PATH}, {WEBP_PATH}\n"
+        f"- AI가 그린 그림 1장 -> '{motion}' 모션으로 {len(frames)}프레임"
+        f" ({total_s:.1f}초){damped}\n"
+        + (f"- 효과: {effect}\n" if effect != "none" else "")
+        + (f"- 글자: {overlay_text}\n" if overlay_text else "")
+        + f"- 규격: {CANVAS}x{CANVAS}px, 투명 배경, GIF {gif_size/1024:.0f}KB"
+          f" (한도 {SAFE_MAX_BYTES//1024}KB)\n"
         + (f"- 참고: {note}\n" if note else "")
         + "화면 왼쪽 사이드바에서 미리보기와 다운로드가 가능하다고 사용자에게 안내하세요."
     )
