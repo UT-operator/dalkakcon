@@ -235,15 +235,29 @@ def generate_pose(base_bytes: bytes, pose: str, quality: str = "low",
 # gpt-image-1.5 는 1024x1024 / 1536x1024 / 1024x1536 만 지원한다.
 # gpt-image-2 는 임의 크기를 지원하지만 '투명 배경'을 지원하지 않아 쓸 수 없다.
 SHEET_LAYOUTS = {
-    4: (2, 2, "1024x1024"),     # 칸 512x512
-    6: (3, 2, "1536x1024"),     # 칸 512x512
-    8: (4, 2, "1536x1024"),     # 칸 384x512
+    4: (2, 2, "1024x1024"),     # 칸 512x512  정사각
+    6: (3, 2, "1536x1024"),     # 칸 512x512  정사각
+    8: (4, 2, "1536x1024"),     # 칸 384x512  가로가 좁다
 }
+# 칸이 정사각이라 가로로 퍼지는 자세도 담기는 격자
+SQUARE_CELL_LAYOUTS = (4, 6)
 
 
-def pick_layout(n_steps: int) -> Tuple[int, int, str, int]:
-    """원하는 프레임 수에 가장 가까운 격자를 고른다. (가로칸, 세로칸, 크기, 실제칸수)"""
-    n = min(SHEET_LAYOUTS, key=lambda k: (abs(k - n_steps), -k))
+def pick_layout(n_steps: int, spread: str = "narrow") -> Tuple[int, int, str, int]:
+    """
+    원하는 프레임 수에 가장 가까운 격자를 고른다. (가로칸, 세로칸, 크기, 실제칸수)
+
+    spread="wide" 면 칸이 정사각인 격자만 쓴다.
+
+    왜 필요한가:
+      4x2 격자는 칸이 384x512 로 가로가 좁다. 서 있거나 팔을 드는 자세는 세로로
+      길쭉해서 문제없지만, 넘어지거나 눕는 자세는 가로로 퍼져서 칸을 넘친다.
+      실제로 '뒤로 넘어지는' 8프레임 결과물에서 분할선이 캐릭터를 가로질러
+      조각났다(면적이 1번 칸 대비 52%까지 떨어졌다). 같은 동작을 3x2(512x512)로
+      뽑았을 때는 멀쩡했다.
+    """
+    allowed = SQUARE_CELL_LAYOUTS if spread == "wide" else tuple(SHEET_LAYOUTS)
+    n = min(allowed, key=lambda k: (abs(k - n_steps), -k))
     cols, rows, size = SHEET_LAYOUTS[n]
     return cols, rows, size, n
 
@@ -269,38 +283,123 @@ def build_sheet_prompt(character_description: str, steps: List[str],
         "in every single cell.\n"
         "Every cell must show the character at the SAME size and the SAME position "
         "within its own cell, as if the camera never moves. Only the pose changes.\n"
+        # 칸을 넘치면 분할선이 캐릭터를 가로질러 조각난다
+        "Keep the whole character well inside its own cell, leaving an empty margin "
+        "of at least 15% on every side of the cell. The character must never touch "
+        "or cross a cell boundary, even in the widest pose. If a pose is wide, draw "
+        "the character smaller so it still fits with that margin.\n"
         "The cells form a strict uniform grid with no visible separators.\n"
         f"Frame order is left to right, then top to bottom:\n{lines}\n"
         f"{STYLE_SUFFIX}"
     )
 
 
-def generate_sprite_sheet(character_description: str, steps: List[str],
-                          quality: str = "high", retries: int = 2
-                          ) -> Tuple[Image.Image, int, int, int]:
+def check_cells(cells: List[Image.Image], min_area_ratio: float = 0.6,
+                max_blobs: int = 3) -> List[str]:
     """
-    스프라이트 시트 1장을 생성한다. (시트, 가로칸, 세로칸, 칸수)
+    분할된 칸이 멀쩡한지 검사한다. 문제가 있으면 사유 목록을 돌려준다.
+
+    왜 필요한가:
+      모델이 격자를 안 지키면 분할선이 캐릭터를 가로질러 반 토막이 나고,
+      옆 칸 조각이 섞여 들어온다. 그런데 지금까지는 그걸 그대로 GIF 로 만들어
+      사용자에게 줬다. 실제로 면적이 1번 칸 대비 52%까지 떨어진 결과물이
+      아무 경고 없이 나갔다.
+
+    두 가지를 본다
+      1. 면적 : 중앙값 대비 min_area_ratio 미만이면 캐릭터가 잘린 것
+      2. 조각 : 떨어진 덩어리가 많으면 옆 칸이 비쳐 들어온 것
+
+    '칸 가장자리에 닿았는가'는 쓰지 않는다. 멀쩡한 시트도 캐릭터가 칸을 꽉 채우면
+    가장자리에 닿기 때문에 오탐이 심했다(정상 시트 2장에서 10건이 잘못 잡혔다).
+    문제는 '닿는 것'이 아니라 '잘리는 것'이다.
+    """
+    import numpy as np
+
+    if len(cells) < 2:
+        return ["칸이 2개 미만"]
+
+    masks = [np.asarray(c.getchannel("A")) > 128 for c in cells]
+    areas = [int(m.sum()) for m in masks]
+    med = float(np.median(areas)) or 1.0
+
+    problems = []
+    for i, a in enumerate(areas, 1):
+        if a < med * min_area_ratio:
+            problems.append(f"{i}번 칸 면적 {a/med*100:.0f}% (캐릭터가 잘림)")
+
+    try:
+        from scipy import ndimage
+        for i, (m, a) in enumerate(zip(masks, areas), 1):
+            lab, cnt = ndimage.label(m)
+            if cnt <= 1:
+                continue
+            sizes = ndimage.sum(m, lab, range(1, cnt + 1))
+            big = int((sizes > a * 0.05).sum())     # 아주 작은 점은 세지 않는다
+            if big > max_blobs:
+                problems.append(f"{i}번 칸에 조각 {big}개 (옆 칸이 비쳐 들어옴)")
+    except ImportError:
+        pass                                        # scipy 없으면 조각 검사만 생략
+
+    return problems
+
+
+def generate_sprite_sheet(character_description: str, steps: List[str],
+                          quality: str = "high", spread: str = "narrow",
+                          retries: int = 2
+                          ) -> Tuple[Image.Image, int, int, int, List[str]]:
+    """
+    스프라이트 시트를 생성하고 분할이 멀쩡한지 확인한다.
+    (시트, 가로칸, 세로칸, 칸수, 경고목록)
+
+    분할이 깨지면 '더 큰 칸'을 쓰는 격자로 자동 재시도한다. 칸이 커지면
+    프레임 수는 줄지만, 토막 난 이모티콘을 내보내는 것보다 낫다.
     업로드 이미지가 있으면 그것을 레퍼런스로 쓰고, 없으면 설명만으로 그린다.
     """
-    cols, rows, size, n = pick_layout(len(steps))
-    prompt = build_sheet_prompt(character_description, steps, cols, rows)
-
     refs = None
     if _reference_image is not None:
         refs = [_as_upload(_reference_image, _reference_mime, "character")]
 
-    last = None
-    for attempt in range(retries + 1):
-        try:
-            raw = _call_image_api(prompt, refs=refs, quality=quality, size=size)
-            sheet = Image.open(io.BytesIO(raw)).convert("RGBA")
-            _save_png(sheet, SHEET_PATH)
-            return sheet, cols, rows, n
-        except Exception as exc:        # noqa: BLE001
-            last = exc
-            if attempt < retries:
-                time.sleep(1.5 * (attempt + 1))
-    raise last
+    want = len(steps)
+    plan = [spread, "wide"] if spread != "wide" else ["wide"]
+    if 4 not in SQUARE_CELL_LAYOUTS:
+        plan.append("wide")
+    notes: List[str] = []
+    last_err = None
+    best = None                                     # 다 실패하면 그나마 나은 것
+
+    for round_no, sp in enumerate(plan):
+        cols, rows, size, n = pick_layout(want, spread=sp)
+        prompt = build_sheet_prompt(character_description, steps, cols, rows)
+        for attempt in range(retries + 1):
+            try:
+                raw = _call_image_api(prompt, refs=refs, quality=quality, size=size)
+                sheet = Image.open(io.BytesIO(raw)).convert("RGBA")
+            except Exception as exc:                # noqa: BLE001
+                last_err = exc
+                if attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+                continue
+
+            cells = split_sheet(sheet, cols, rows)
+            bad = check_cells(cells)
+            if not bad:
+                _save_png(sheet, SHEET_PATH)
+                return sheet, cols, rows, n, notes
+            if best is None:
+                best = (sheet, cols, rows, n, bad)
+            last_err = None
+            break                                   # 생성은 됐으니 격자를 바꿔 재시도
+
+        if round_no == 0 and best is not None:
+            notes.append(f"{cols}x{rows} 격자에서 분할이 깨져 "
+                         f"더 큰 칸으로 다시 생성했습니다 ({best[4][0]})")
+
+    if best is not None:
+        sheet, cols, rows, n, bad = best
+        _save_png(sheet, SHEET_PATH)
+        notes.append("격자가 완전하지는 않습니다: " + "; ".join(bad[:3]))
+        return sheet, cols, rows, n, notes
+    raise last_err or RuntimeError("스프라이트 시트 생성 실패")
 
 
 def split_sheet(sheet: Image.Image, cols: int, rows: int,
@@ -803,6 +902,7 @@ def shrink_until_under_limit(frames: List[Image.Image], path: str,
 def create_animated_emoticon(
     character_description: str,
     frame_steps: List[str],
+    pose_spread: Literal["narrow", "wide"] = "narrow",
     effect: Literal["none", "heart", "sparkle", "tear",
                     "sweat", "anger", "note"] = "none",
     overlay_text: str = "",
@@ -822,6 +922,7 @@ def create_animated_emoticon(
     Args:
         character_description: 캐릭터의 외형, 색상, 분위기를 묘사한 영문 문장. 사용자가 이미지를 올렸다면 그 캐릭터를 유지하면서 보강할 설명을 쓴다.
         frame_steps: 프레임별 자세를 묘사한 영문 문장 리스트. 6개 또는 8개를 권장하고 4개도 가능하다. 각 문장은 '한 장의 정지 그림'을 묘사하며 움직임을 설명하지 않는다. 동작이 자연스럽게 이어지도록 순서대로 쓰고, 반복 재생되므로 첫 번째와 마지막은 같은 기본 자세로 둔다. 마지막 자세가 이모티콘샵 썸네일이 되므로 캐릭터를 가장 잘 보여주는 자세로 한다. 효과나 글자는 쓰지 않는다. 예시는 front paw down at its side with a calm smile / front paw lifted to chest height / front paw raised high beside the head with an open smile 처럼 쓴다.
+        pose_spread: 동작이 가로로 얼마나 퍼지는지 고른다. narrow 는 서 있거나 팔을 드는 것처럼 세로로 길쭉한 동작이다. wide 는 넘어지기, 눕기, 구르기, 대자로 뻗기처럼 가로로 넓게 퍼지는 동작이다. wide 를 고르면 칸을 크게 잡아 그림이 잘리지 않는다. 대신 프레임 수가 최대 6개로 줄어든다.
         effect: 덧붙일 효과를 고른다. none 은 효과 없음이다. heart 는 하트가 떠올라 설렘에 쓴다. sparkle 은 반짝임으로 최고나 뿌듯함에 쓴다. tear 는 눈물로 슬픔에 쓴다. sweat 는 땀방울로 당황에 쓴다. anger 는 김이 뿜어져 화남에 쓴다. note 는 음표가 떠올라 신남에 쓴다.
         overlay_text: 이모티콘에 넣을 짧은 한글 글자. 필요 없으면 빈 문자열로 둔다. ㅋㅋㅋ 고마워 미안 같이 짧을수록 좋다. 글자는 폰트로 정확히 찍히므로 그림에 맡기지 않는다.
         speed_ms: 프레임 하나의 재생 시간을 밀리초로 준다. 80에서 150 사이를 권장하고 작을수록 빠르다.
@@ -836,8 +937,9 @@ def create_animated_emoticon(
 
     try:
         # (1) 스프라이트 시트 1장 생성 — AI 호출은 여기 한 번뿐
-        sheet, cols, rows, n_cells = generate_sprite_sheet(
-            character_description, frame_steps, quality=quality)
+        sheet, cols, rows, n_cells, warns = generate_sprite_sheet(
+            character_description, frame_steps, quality=quality,
+            spread=pose_spread)
 
         # (2) 칸 분할
         cells = split_sheet(sheet, cols, rows)
@@ -907,6 +1009,7 @@ def create_animated_emoticon(
         + f"- 규격: {CANVAS}x{CANVAS}px, 투명 배경, GIF {gif_size/1024:.0f}KB"
           f" (한도 {SAFE_MAX_BYTES//1024}KB)\n"
         + (f"- 참고: {note}\n" if note else "")
+        + "".join(f"- 주의: {w}\n" for w in warns)
         + "화면 왼쪽 사이드바에서 미리보기와 다운로드가 가능하다고 사용자에게 안내하세요."
     )
 

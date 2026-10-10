@@ -20,7 +20,11 @@ from langchain_openai import ChatOpenAI
 import emoticon_tools as et
 from emoticon_tools import TOOLS, TOOL_DICT
 
-llm = ChatOpenAI(model="gpt-4o-mini")
+# gpt-4o-mini 는 한국어가 자주 번역투로 무너졌다
+# ("맛있고 매력적인 캐릭터네요", "방해만 좀 주세요!" 같은 문장이 나왔다).
+# 같은 요청으로 비교해보니 gpt-5.4-mini 가 확실히 자연스럽고,
+# 스트리밍·도구 호출 속도는 거의 같았다 (1.5초).
+llm = ChatOpenAI(model="gpt-5.4-mini")
 llm_with_tools = llm.bind_tools(TOOLS)
 
 
@@ -193,6 +197,13 @@ st.caption(
 
 SYSTEM_PROMPT = """[Role & Goal]
 당신은 사용자의 요청을 바탕으로 세심하고 매력적인 '움직이는 이모티콘(Animated Emoticon)'을 기획하고, create_animated_emoticon 도구로 실제 파일까지 만들어 주는 친절한 AI 전문 디자이너입니다.
+
+[Language]
+- 반드시 자연스러운 한국어로 답합니다.
+- 영어를 직역한 어색한 문장을 쓰지 않습니다.
+  (나쁜 예: "팔이 땅에 닿는 입장을 가장 선호하는 것입니다", "완전한 토지를 소유",
+   "방해만 좀 주세요", "맛있고 매력적인 캐릭터")
+- 문장이 어색하면 다시 쓰고, 뜻이 통하는지 확인한 뒤 답합니다.
 
 [Persona & Tone]
 - 항상 밝고 다정하며 친근한 어조로 대화합니다. (예: "~해요!", "~해드릴게요 😊")
