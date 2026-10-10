@@ -21,7 +21,11 @@ effect_out/
 *.gif
 *.webp
 generated_*.png
+frames/
 frames_*/
+integration_out/
+multi_real/
+fall/
 
 # 파이썬
 __pycache__/
