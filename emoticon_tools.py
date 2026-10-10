@@ -47,6 +47,7 @@ MAX_BYTES = SAFE_MAX_BYTES      # 기본값은 어디든 통과하는 쪽으로 
 
 OUT_DIR = os.environ.get("DDALKAK_OUT_DIR", "/content")
 GIF_PATH = os.path.join(OUT_DIR, "generated_emoticon.gif")
+SHEET_PATH = os.path.join(OUT_DIR, "generated_sheet.png")   # 스프라이트 시트 원본
 WEBP_PATH = os.path.join(OUT_DIR, "generated_emoticon.webp")
 BASE_PATH = os.path.join(OUT_DIR, "generated_base.png")
 FRAME_PATH_FMT = os.path.join(OUT_DIR, "generated_frame_{:02d}.png")
@@ -120,13 +121,16 @@ def _supports_input_fidelity(model: str) -> bool:
 
 
 def _call_image_api(prompt: str, refs: Optional[List[Tuple]] = None,
-                    quality: str = "low") -> bytes:
-    """이미지 1장 생성. refs가 있으면 edit(레퍼런스 기반), 없으면 generate."""
+                    quality: str = "low", size: Optional[str] = None) -> bytes:
+    """
+    이미지 1장 생성. refs가 있으면 edit(레퍼런스 기반), 없으면 generate.
+    size 를 주면 그 크기로 뽑는다 (스프라이트 시트는 1536x1024 등을 쓴다).
+    """
     client = _client()
     common = dict(
         model=IMAGE_MODEL,
         prompt=prompt,
-        size=GEN_SIZE,
+        size=size or GEN_SIZE,
         quality=quality,
         background="transparent",   # 생성 시점부터 투명하게 뽑는다 (사후 제거보다 외곽선이 안전)
         output_format="png",        # background="transparent"는 png/webp에서만 유효
@@ -218,42 +222,155 @@ def generate_pose(base_bytes: bytes, pose: str, quality: str = "low",
     raise last
 
 
-def generate_frames(base: Image.Image, frame_prompts: List[str],
-                    quality: str = "low", retries: int = 2
-                    ) -> Tuple[List[Image.Image], List[Tuple[int, str]]]:
-    """
-    기준 원화를 레퍼런스로 각 프레임을 동시에 생성한다.
+# ====================================================== 스프라이트 시트
+# 프레임을 한 장씩 따로 생성하면 그릴 때마다 색과 선이 미세하게 달라져서
+# 재생할 때 캐릭터가 부글거린다(boiling). 실측으로 색 표준편차가 R 4.8 / B 6.6 이었고,
+# 진짜 카카오 이모티콘은 R 1.5 / B 2.0 이었다.
+#
+# 그래서 '한 번의 생성'으로 여러 프레임을 한 장에 그리게 한다.
+# 같은 붓질 안에서 나오므로 색·선·비율이 원리적으로 같아진다.
+# 실측 결과 색 표준편차가 R 0.5 / B 0.4 까지 떨어졌다 (진짜 이모티콘보다 안정적).
 
-    한 장이 끝내 실패해도 나머지는 살린다.
-    돌려주는 값: (성공한 프레임 리스트, [(순번, 실패 사유), ...])
-    """
-    base_bytes = _to_png_bytes(base)
+# 칸 수 -> (가로칸, 세로칸, 생성 크기)
+# gpt-image-1.5 는 1024x1024 / 1536x1024 / 1024x1536 만 지원한다.
+# gpt-image-2 는 임의 크기를 지원하지만 '투명 배경'을 지원하지 않아 쓸 수 없다.
+SHEET_LAYOUTS = {
+    4: (2, 2, "1024x1024"),     # 칸 512x512
+    6: (3, 2, "1536x1024"),     # 칸 512x512
+    8: (4, 2, "1536x1024"),     # 칸 384x512
+}
 
-    def one(item):
-        idx, fp = item
+
+def pick_layout(n_steps: int) -> Tuple[int, int, str, int]:
+    """원하는 프레임 수에 가장 가까운 격자를 고른다. (가로칸, 세로칸, 크기, 실제칸수)"""
+    n = min(SHEET_LAYOUTS, key=lambda k: (abs(k - n_steps), -k))
+    cols, rows, size = SHEET_LAYOUTS[n]
+    return cols, rows, size, n
+
+
+def build_sheet_prompt(character_description: str, steps: List[str],
+                       cols: int, rows: int) -> str:
+    """
+    스프라이트 시트 생성 프롬프트.
+
+    핵심 지시 세 가지
+      1. 모든 칸이 '같은 캐릭터, 같은 색, 같은 선 굵기'
+      2. 모든 칸에서 캐릭터가 '같은 크기, 칸 안 같은 위치' (카메라 고정)
+      3. 칸 구분선·번호·글자 없음
+    """
+    n = cols * rows
+    lines = "\n".join(f"  cell {i + 1}: {s}" for i, s in enumerate(steps[:n]))
+    return (
+        f"Create ONE image that is a {cols}x{rows} sprite sheet of animation frames "
+        f"({cols} columns, {rows} rows, {n} cells of equal size).\n"
+        f"The character is: {character_description}.\n"
+        "Use the reference image as the EXACT character design. Keep the identical "
+        "character, identical colors, identical line weight and identical art style "
+        "in every single cell.\n"
+        "Every cell must show the character at the SAME size and the SAME position "
+        "within its own cell, as if the camera never moves. Only the pose changes.\n"
+        "The cells form a strict uniform grid with no visible separators.\n"
+        f"Frame order is left to right, then top to bottom:\n{lines}\n"
+        f"{STYLE_SUFFIX}"
+    )
+
+
+def generate_sprite_sheet(character_description: str, steps: List[str],
+                          quality: str = "high", retries: int = 2
+                          ) -> Tuple[Image.Image, int, int, int]:
+    """
+    스프라이트 시트 1장을 생성한다. (시트, 가로칸, 세로칸, 칸수)
+    업로드 이미지가 있으면 그것을 레퍼런스로 쓰고, 없으면 설명만으로 그린다.
+    """
+    cols, rows, size, n = pick_layout(len(steps))
+    prompt = build_sheet_prompt(character_description, steps, cols, rows)
+
+    refs = None
+    if _reference_image is not None:
+        refs = [_as_upload(_reference_image, _reference_mime, "character")]
+
+    last = None
+    for attempt in range(retries + 1):
         try:
-            return idx, generate_pose(base_bytes, fp, quality=quality,
-                                      retries=retries, name=f"base{idx}"), None
-        except Exception as exc:       # noqa: BLE001
-            return idx, None, f"{type(exc).__name__}: {exc}"
-
-    results: List[Optional[Image.Image]] = [None] * len(frame_prompts)
-    failures: List[Tuple[int, str]] = []
-
-    with ThreadPoolExecutor(max_workers=min(6, max(1, len(frame_prompts)))) as pool:
-        for idx, img, err in pool.map(one, list(enumerate(frame_prompts))):
-            if img is None:
-                failures.append((idx + 1, err))
-            else:
-                results[idx] = img
-
-    frames = [f for f in results if f is not None]
-    for i, f in enumerate(frames):
-        _save_png(f, FRAME_PATH_FMT.format(i + 1))
-    return frames, failures
+            raw = _call_image_api(prompt, refs=refs, quality=quality, size=size)
+            sheet = Image.open(io.BytesIO(raw)).convert("RGBA")
+            _save_png(sheet, SHEET_PATH)
+            return sheet, cols, rows, n
+        except Exception as exc:        # noqa: BLE001
+            last = exc
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+    raise last
 
 
-# --------------------------------------- (3) 투명 배경 안정화
+def split_sheet(sheet: Image.Image, cols: int, rows: int,
+                min_fill: float = 0.01) -> List[Image.Image]:
+    """시트를 칸으로 자른다. 거의 비어 있는 칸은 버린다."""
+    import numpy as np
+
+    w, h = sheet.size
+    cw, ch = w // cols, h // rows
+    out = []
+    for r in range(rows):
+        for c in range(cols):
+            cell = sheet.crop((c * cw, r * ch, (c + 1) * cw, (r + 1) * ch))
+            if (np.asarray(cell.getchannel("A")) > 200).mean() < min_fill:
+                continue
+            out.append(cell)
+    return out
+
+
+def align_frames(cells: List[Image.Image], band: float = 0.40,
+                 limit_ratio: float = 0.35) -> List[Image.Image]:
+    """
+    칸마다 캐릭터가 좌우로 어긋난 것을 맞춘다.
+
+    모델이 칸 안에서 캐릭터를 늘 같은 자리에 두지는 않는다. 실측으로 132px
+    (칸 폭의 34%)까지 어긋났고, 그대로 재생하면 캐릭터가 좌우로 덜컹거린다.
+
+    방법: 아래쪽 band 부분(몸통·다리)의 '열별 픽셀 수' 1차원 프로파일을
+          1번 프레임과 상호상관시켜 가장 잘 맞는 가로 이동량을 찾는다.
+          팔은 움직이므로 위쪽은 보지 않는다.
+
+    왜 이 방법인가 (8가지를 같은 기준으로 비교한 결과)
+      보정 없음 0.409 / bbox 중심 0.567 / 하단 겹침최대 0.739 / 이 방법 0.738
+      품질은 겹침최대와 같은데 9배 빠르다 (24ms vs 211ms).
+    세로는 실측 1px 밖에 안 어긋나 보정하지 않는다.
+    """
+    import numpy as np
+
+    if len(cells) < 2:
+        return list(cells)
+
+    h = cells[0].size[1]
+    y0 = int(h * (1 - band))
+    limit = int(cells[0].size[0] * limit_ratio)
+
+    def profile(img):
+        a = np.asarray(img.getchannel("A"))[y0:, :] > 128
+        p = a.sum(axis=0).astype(float)
+        return p - p.mean()
+
+    ref = profile(cells[0])
+    out = [cells[0]]
+    for cell in cells[1:]:
+        cur = profile(cell)
+        best, shift = -1e18, 0
+        for s in range(-limit, limit + 1):
+            v = float((ref * np.roll(cur, s)).sum())
+            if v > best:
+                best, shift = v, s
+        if shift == 0:
+            out.append(cell)
+            continue
+        arr = np.roll(np.asarray(cell), shift, axis=1)
+        if shift > 0:
+            arr[:, :shift] = 0
+        else:
+            arr[:, shift:] = 0
+        out.append(Image.fromarray(arr, "RGBA"))
+    return out
+
 
 def stabilize_alpha(img: Image.Image, threshold: int = 24) -> Image.Image:
     """
@@ -685,68 +802,77 @@ def shrink_until_under_limit(frames: List[Image.Image], path: str,
 @tool(parse_docstring=True)
 def create_animated_emoticon(
     character_description: str,
-    pose: str,
-    motion: Literal["breathe", "bounce", "nod", "rock", "shake", "float",
-                    "slide", "spin_wobble", "jump", "drop", "pop",
-                    "zoom_punch"] = "bounce",
+    frame_steps: List[str],
     effect: Literal["none", "heart", "sparkle", "tear",
                     "sweat", "anger", "note"] = "none",
     overlay_text: str = "",
-    speed_ms: int = 80,
-    quality: Literal["low", "medium", "high"] = "low",
+    speed_ms: int = 110,
+    hold_last_ms: int = 300,
+    quality: Literal["low", "medium", "high"] = "high",
 ) -> str:
     """움직이는 이모티콘 파일(GIF)을 실제로 만든다.
 
     사용자가 이모티콘 제작을 명확히 요청했을 때만 호출한다. 기획안만 보여달라고 하면
-    호출하지 말고 대화로만 답한다. character_description 과 pose 는 반드시 영문으로 쓴다.
+    호출하지 말고 대화로만 답한다. character_description 과 frame_steps 는 영문으로 쓴다.
 
-    AI는 '포즈 한 장'만 그리고, 움직임과 효과는 수식과 도형으로 만든다. 그래서
-    생성이 빠르고 저렴하다. 같은 대화 안에서 여러 번 호출하면 캐릭터가 유지된다.
+    한 번의 생성으로 모든 프레임을 한 장(스프라이트 시트)에 그리기 때문에, 프레임마다
+    색과 선이 흔들리지 않는다. 손 흔들기, 꾸벅 졸기처럼 팔다리가 따로 움직이는 동작도
+    된다. 같은 대화 안에서 여러 번 호출하면 캐릭터가 유지된다.
 
     Args:
-        character_description: 캐릭터의 외형, 색상, 분위기를 묘사한 영문 문장. 사용자가 이미지를 올렸다면 그 캐릭터를 유지하면서 보강할 설명을 쓴다. 대화 중 한 번만 쓰이고 이후에는 처음 만든 캐릭터가 재사용된다.
-        pose: 이 이모티콘의 포즈와 표정을 묘사한 영문 문장. 움직임은 쓰지 않고 '한 장의 그림'으로 묘사한다. 예를 들어 giving a thumbs up with a proud smile 처럼 쓴다. 효과나 글자는 넣지 않는다. 그건 따로 처리된다.
-        motion: 어떻게 움직일지 고른다. breathe 는 거의 멈춘 듯 숨만 쉬고 피곤함이나 잔잔한 감정에 쓴다. bounce 는 통통 튀며 가장 무난하다. nod 는 끄덕임으로 알았어나 고마워에 쓴다. rock 은 좌우로 갸우뚱한다. shake 는 부들부들 떨며 화남이나 당황에 쓴다. float 는 둥둥 떠다니며 멍때림에 쓴다. slide 는 좌우로 미끄러진다. spin_wobble 은 크게 갸우뚱하며 모르겠다는 느낌이다. jump 는 높이 점프하며 신남이나 축하에 쓴다. drop 은 위에서 뚝 떨어진다. pop 은 뿅 나타났다 사라진다. zoom_punch 는 확 커졌다 돌아오며 좋아나 최고 같은 강조에 쓴다.
+        character_description: 캐릭터의 외형, 색상, 분위기를 묘사한 영문 문장. 사용자가 이미지를 올렸다면 그 캐릭터를 유지하면서 보강할 설명을 쓴다.
+        frame_steps: 프레임별 자세를 묘사한 영문 문장 리스트. 6개 또는 8개를 권장하고 4개도 가능하다. 각 문장은 '한 장의 정지 그림'을 묘사하며 움직임을 설명하지 않는다. 동작이 자연스럽게 이어지도록 순서대로 쓰고, 반복 재생되므로 첫 번째와 마지막은 같은 기본 자세로 둔다. 마지막 자세가 이모티콘샵 썸네일이 되므로 캐릭터를 가장 잘 보여주는 자세로 한다. 효과나 글자는 쓰지 않는다. 예시는 front paw down at its side with a calm smile / front paw lifted to chest height / front paw raised high beside the head with an open smile 처럼 쓴다.
         effect: 덧붙일 효과를 고른다. none 은 효과 없음이다. heart 는 하트가 떠올라 설렘에 쓴다. sparkle 은 반짝임으로 최고나 뿌듯함에 쓴다. tear 는 눈물로 슬픔에 쓴다. sweat 는 땀방울로 당황에 쓴다. anger 는 김이 뿜어져 화남에 쓴다. note 는 음표가 떠올라 신남에 쓴다.
-        overlay_text: 이모티콘에 넣을 짧은 한글 글자. 필요 없으면 빈 문자열로 둔다. ㅋㅋㅋ 고마워 미안 같이 짧을수록 좋다. 글자는 폰트로 정확히 찍히므로 AI에게 맡기지 않는다.
-        speed_ms: 프레임 하나의 기준 재생 시간을 밀리초로 준다. 60에서 120 사이를 권장하고 작을수록 빠르다.
-        quality: 그림 품질이다. low 는 빠르고 저렴하다. 사용자가 더 좋은 품질을 원하면 medium 이나 high 를 쓴다.
+        overlay_text: 이모티콘에 넣을 짧은 한글 글자. 필요 없으면 빈 문자열로 둔다. ㅋㅋㅋ 고마워 미안 같이 짧을수록 좋다. 글자는 폰트로 정확히 찍히므로 그림에 맡기지 않는다.
+        speed_ms: 프레임 하나의 재생 시간을 밀리초로 준다. 80에서 150 사이를 권장하고 작을수록 빠르다.
+        hold_last_ms: 마지막 프레임에서 더 머무는 시간을 밀리초로 준다. 동작이 끝나고 잠깐 쉬는 느낌을 준다. 0이면 쉬지 않는다.
+        quality: 그림 품질이다. high 를 권장한다. 빠르게 확인만 할 때는 low 를 쓴다.
     """
     import geo_effects as gfx
-    import geo_motion as gmo
 
     canvas = (CANVAS, CANVAS)
+    if len(frame_steps) < 2:
+        return "오류: frame_steps 가 너무 적습니다. 6개 또는 8개를 주세요."
+
     try:
-        # (1) 기준 원화 — 대화 중 한 번만 만들고 재사용해 캐릭터를 고정한다
-        base = get_base_sheet(character_description, quality=quality)
+        # (1) 스프라이트 시트 1장 생성 — AI 호출은 여기 한 번뿐
+        sheet, cols, rows, n_cells = generate_sprite_sheet(
+            character_description, frame_steps, quality=quality)
 
-        # (2) 이 이모티콘의 포즈 한 장 (AI 호출은 여기까지)
-        art = generate_pose(_to_png_bytes(base), pose, quality=quality, name="pose")
-        _save_png(art, FRAME_PATH_FMT.format(1))
+        # (2) 칸 분할
+        cells = split_sheet(sheet, cols, rows)
+        if len(cells) < 2:
+            return (f"오류: 격자가 제대로 생성되지 않았습니다 "
+                    f"({len(cells)}/{n_cells}칸만 내용이 있음). 다시 시도해 보세요.")
 
-        # (3) 투명 배경 정리
-        clean = stabilize_alpha(art)
+        # (3) 칸마다 어긋난 좌우 위치 맞추기
+        cells = align_frames(cells)
 
-        # (4) 모션이 움직일 공간과 글자 자리를 빼고 배치
+        # (4) 투명 배경 정리
+        cleaned = [stabilize_alpha(c) for c in cells]
+
+        # (5) 공통 배율로 규격 캔버스에 배치. 글자가 있으면 위를 비운다
         reserve = 0.20 if overlay_text else (0.08 if effect != "none" else 0.0)
-        sheet, box, mscale = fit_art_for_motion(clean, motion, canvas=canvas,
-                                                reserve_top=reserve)
-        sheet = fill_interior_holes(sheet)
-
-        # (5) 움직임 — AI 아님. 수식이 만든다
-        frames, durations = gmo.apply_motion(sheet, motion, base_ms=speed_ms,
-                                             scale=mscale)
+        frames = fit_frames_to_canvas(cleaned, canvas=canvas, margin_ratio=0.05,
+                                      reserve_top=reserve)
+        frames = [fill_interior_holes(f) for f in frames]
 
         # (6) 효과와 글자 — Pillow가 캐릭터 위치에 맞춰 직접 그린다
-        anchors = gfx.anchors_from_bbox(box, canvas)
-        if effect != "none":
-            frames = gfx.composite(frames, gfx.EFFECTS[effect](
-                n=len(frames), anchors=anchors, canvas=canvas))
-        if overlay_text:
-            frames = gfx.composite(frames, gfx.fx_text(
-                overlay_text, n=len(frames), anchors=anchors, canvas=canvas))
+        box = union_bbox(frames)
+        if box and (effect != "none" or overlay_text):
+            anchors = gfx.anchors_from_bbox(box, canvas)
+            if effect != "none":
+                frames = gfx.composite(frames, gfx.EFFECTS[effect](
+                    n=len(frames), anchors=anchors, canvas=canvas))
+            if overlay_text:
+                frames = gfx.composite(frames, gfx.fx_text(
+                    overlay_text, n=len(frames), anchors=anchors, canvas=canvas))
 
-        # (7) 저장 — GIF + 번호 붙인 PNG 프레임(카카오 WebP Animator 용)
+        # (7) 재생 시간 — 마지막 프레임에서 잠깐 쉰다
+        durations = [speed_ms] * len(frames)
+        durations[-1] = min(2000, speed_ms + max(0, hold_last_ms))
+
+        # (8) 저장 — GIF + 번호 붙인 PNG 프레임(카카오 WebP Animator 용)
         gif_size, note = shrink_until_under_limit(frames, GIF_PATH, durations,
                                                   limit=SAFE_MAX_BYTES)
         webp_size = save_webp(frames, WEBP_PATH, durations)
@@ -760,20 +886,22 @@ def create_animated_emoticon(
         return f"이모티콘 생성 실패: {type(exc).__name__}: {exc}"
 
     last_result.update(
-        gif_path=GIF_PATH, webp_path=WEBP_PATH, base_path=BASE_PATH,
+        gif_path=GIF_PATH, webp_path=WEBP_PATH, sheet_path=SHEET_PATH,
         frames_dir=frames_dir,
-        frame_paths=[FRAME_PATH_FMT.format(1)],   # AI가 그린 원본 1장
-        unique_frames=1, total_frames=len(frames),
-        loop_mode=motion, effect=effect, duration_ms=speed_ms,
-        motion_scale=round(mscale, 2), gif_size=gif_size, webp_size=webp_size,
+        frame_paths=[SHEET_PATH],          # AI가 그린 원본 = 스프라이트 시트 한 장
+        unique_frames=len(frames), total_frames=len(frames),
+        loop_mode=f"{cols}x{rows} 시트", effect=effect,
+        duration_ms=speed_ms, gif_size=gif_size, webp_size=webp_size,
     )
 
     total_s = sum(durations) / 1000
-    damped = "" if mscale > 0.99 else f" (여백에 맞춰 움직임을 {mscale:.0%}로 줄임)"
+    dropped = (f" (요청 {len(frame_steps)}칸 중 {len(frames)}칸 사용)"
+               if len(frames) != len(frame_steps) else "")
     return (
         f"이모티콘 생성 완료!\n"
-        f"- AI가 그린 그림 1장 -> '{motion}' 모션으로 {len(frames)}프레임"
-        f" ({total_s:.1f}초){damped}\n"
+        f"- {cols}x{rows} 스프라이트 시트 1장을 생성해 {len(frames)}프레임으로 분할"
+        f"{dropped}\n"
+        f"- 재생 {total_s:.1f}초 (프레임당 {speed_ms}ms, 마지막 {durations[-1]}ms)\n"
         + (f"- 효과: {effect}\n" if effect != "none" else "")
         + (f"- 글자: {overlay_text}\n" if overlay_text else "")
         + f"- 규격: {CANVAS}x{CANVAS}px, 투명 배경, GIF {gif_size/1024:.0f}KB"

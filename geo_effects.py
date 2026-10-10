@@ -79,11 +79,21 @@ def _pick(anchors, name, canvas=(CANVAS, CANVAS)):
     return anchors[name]
 
 
-def _scale_of(anchors) -> float:
-    """캐릭터 크기에 맞춰 효과 크기를 비례시키기 위한 배율."""
-    if anchors and "_size" in anchors:
-        return max(0.45, min(1.8, anchors["_size"][1] / 220.0))
-    return 1.0
+def _scale_of(anchors, canvas=(CANVAS, CANVAS)) -> float:
+    """
+    효과 크기 배율.
+
+    캐릭터 크기에 비례시키되, '캔버스에 남은 여백'도 함께 본다.
+    캐릭터가 화면을 꽉 채우면 효과를 놓을 자리가 없는데, 크기만 보고 키우면
+    효과가 캔버스 밖으로 잘린다. (실제로 sparkle·anger·note 가 잘렸다)
+    """
+    if not anchors or "_size" not in anchors:
+        return 1.0
+    base = anchors["_size"][1] / 220.0
+    x0, y0, x1, y1 = anchors["_bbox"]
+    cw, ch = canvas
+    room = max(8, min(y0, x0, cw - x1, ch - y1))   # 사방 여백 중 가장 좁은 곳
+    return max(0.35, min(1.8, base, room / 26.0))
 
 # ------------------------------------------------------------------- 폰트
 
@@ -260,6 +270,25 @@ def _note_shape(d: ImageDraw.ImageDraw, cx: float, cy: float, r: float,
            fill=outline, width=max(3, w + 1))
 
 
+SAFE = 3          # 경계에 딱 붙지 않도록 두는 여유 (px)
+
+
+def _rise_room(ay: float, half: float, floor: float = 0.0) -> float:
+    """
+    위로 떠오르는 효과(하트·음표)가 캔버스 밖으로 나가지 않을 상승 높이.
+
+    half 는 그 효과가 중심에서 위로 얼마나 뻗는지(반지름 + 기둥 등)다.
+    이걸 빼지 않으면 '중심'은 캔버스 안인데 '그림'은 잘린다.
+    floor 를 크게 주면 안전치를 덮어써서 오히려 잘리므로 기본값은 0이다.
+    """
+    return max(floor, min(ay - half - SAFE, ay))
+
+
+def _clamp_x(x: float, half: float, cw: int) -> float:
+    """좌우로도 잘리지 않게 중심 x 를 캔버스 안으로 밀어 넣는다."""
+    return max(half + SAFE, min(cw - half - SAFE, x))
+
+
 def _fade(p: float) -> float:
     """0에서 시작해 중간에 최대, 1에서 다시 0. 루프 이음새를 없애는 핵심."""
     return math.sin(math.pi * max(0.0, min(1.0, p)))
@@ -307,11 +336,14 @@ def fx_heart(n: int = 12, count: int = 3, anchors=None,
     """
     PINK = (255, 96, 128)
     x0, y0, x1, y1 = (anchors or default_anchors(canvas))["_bbox"]
-    sc = _scale_of(anchors)
+    sc = _scale_of(anchors, canvas)
     pad = 18 * sc
+    r_max = 20 * sc
+    drift_max = (10 + 6 * (count // 2)) * sc
     start_y = y0 + (y1 - y0) * 0.55
-    rise = max(50.0, start_y - 16)
-    sides = [x0 - pad, x1 + pad]
+    rise = _rise_room(start_y, r_max * 1.2, floor=50.0)
+    sides = [_clamp_x(x0 - pad, r_max + drift_max, canvas[0]),
+             _clamp_x(x1 + pad, r_max + drift_max, canvas[0])]
 
     def draw(d, k, p, al):
         base_x = sides[k % 2]
@@ -332,10 +364,15 @@ def fx_sparkle(n: int = 12, count: int = 4, anchors=None,
     """
     GOLD = (255, 214, 64)
     x0, y0, x1, y1 = (anchors or default_anchors(canvas))["_bbox"]
-    sc = _scale_of(anchors)
+    sc = _scale_of(anchors, canvas)
     pad = 14 * sc
-    spots = [(x0 - pad, y0 + (y1 - y0) * 0.18), (x1 + pad, y0 + (y1 - y0) * 0.10),
-             (x0 + (x1 - x0) * 0.22, y0 - pad), (x0 + (x1 - x0) * 0.78, y0 - pad * 0.6)]
+    r_max = 25 * sc
+    cw, chh = canvas
+    raw = [(x0 - pad, y0 + (y1 - y0) * 0.18), (x1 + pad, y0 + (y1 - y0) * 0.10),
+           (x0 + (x1 - x0) * 0.22, y0 - pad), (x0 + (x1 - x0) * 0.78, y0 - pad * 0.6)]
+    spots = [(_clamp_x(sx, r_max, cw),
+              max(r_max + SAFE, min(chh - r_max - SAFE, sy)))
+             for sx, sy in raw]
 
     def draw(d, k, p, al):
         cx, cy = spots[k % len(spots)]
@@ -349,7 +386,7 @@ def fx_tear(n: int = 12, anchors=None, canvas=(CANVAS, CANVAS)) -> List[Image.Im
     """슬픔. 양쪽 눈에서 눈물이 흐른다."""
     BLUE = (120, 196, 255)
     eyes = (_pick(anchors, "left_eye", canvas), _pick(anchors, "right_eye", canvas))
-    sc = _scale_of(anchors)
+    sc = _scale_of(anchors, canvas)
 
     def draw(d, k, p, al):
         ex, ey = eyes[k]
@@ -364,12 +401,16 @@ def fx_sweat(n: int = 12, anchors=None, canvas=(CANVAS, CANVAS)) -> List[Image.I
     BLUE = (150, 210, 255)
     srcs = ((_pick(anchors, "head_tr", canvas), 1),
             (_pick(anchors, "head_tl", canvas), -1))
-    sc = _scale_of(anchors)
+    sc = _scale_of(anchors, canvas)
+
+    cw, chh = canvas
+    r_max = 12 * sc
 
     def draw(d, k, p, al):
         (sx, sy), sgn = srcs[k]
-        d.polygon(_drop_polygon(sx + sgn * 44 * sc * p,
-                                sy - 26 * sc * p + 58 * sc * p * p, (10 - 2 * p) * sc),
+        cx = _clamp_x(sx + sgn * 44 * sc * p, r_max, cw)
+        cy = max(r_max * 1.8, min(chh - r_max, sy - 26 * sc * p + 58 * sc * p * p))
+        d.polygon(_drop_polygon(cx, cy, (10 - 2 * p) * sc),
                   fill=_a(BLUE, al), outline=_a(LINE[:3], al), width=2)
 
     return _particles(n, 2, canvas, draw)
@@ -379,13 +420,17 @@ def fx_anger(n: int = 12, anchors=None, canvas=(CANVAS, CANVAS)) -> List[Image.I
     """화남. 김이 머리 위로 뿜어져 올라간다. (양옆 2곳 × 2덩이 = 입자 4개)"""
     GRAY = (228, 228, 236)
     srcs = (_pick(anchors, "head_tl", canvas), _pick(anchors, "head_tr", canvas))
-    sc = _scale_of(anchors)
+    sc = _scale_of(anchors, canvas)
+
+    cw, chh = canvas
+    r_max = 28 * sc
 
     def draw(d, k, p, al):
         sx, sy = srcs[k % 2]
         r = (11 + 17 * p) * sc
-        cx = sx + (8 if k % 2 else -8) * sc * p
-        cy = sy - 54 * sc * p
+        lift = min(54 * sc, _rise_room(sy, r_max, floor=10.0))
+        cx = _clamp_x(sx + (8 if k % 2 else -8) * sc * p, r_max, cw)
+        cy = sy - lift * p
         d.ellipse([cx - r, cy - r * 0.78, cx + r, cy + r * 0.78],
                   fill=_a(GRAY, al * 0.92), outline=_a(LINE[:3], al * 0.74), width=2)
 
@@ -397,11 +442,17 @@ def fx_note(n: int = 12, count: int = 2, anchors=None,
     """신남. 음표가 캐릭터 오른쪽 위 허공으로 떠오른다."""
     PURPLE = (160, 128, 255)
     ax, ay = _pick(anchors, "float_tr", canvas)
-    sc = _scale_of(anchors) * 1.25                      # 작게 보여서 조금 키운다
-    rise = max(36.0, min(96.0 * sc, ay - 14))           # 캔버스 밖으로 안 나가게
+    sc = _scale_of(anchors, canvas) * 1.25                      # 작게 보여서 조금 키운다
+    r_max = 19 * sc
+    sway = 16 * sc
+    # 음표는 머리 위로 기둥과 깃발이 더 올라간다 -> 반지름의 1.7배를 여유로 본다
+    top_need = r_max * 1.7 + SAFE
+    ay = max(top_need, ay)                       # 시작점부터 안으로
+    rise = max(0.0, min(96.0 * sc, _rise_room(ay, r_max * 1.7)))
+    ax = _clamp_x(ax, r_max + sway, canvas[0])
 
     def draw(d, k, p, al):
-        _note_shape(d, ax + 16 * sc * math.sin(p * 4 + k * 2), ay - rise * p,
+        _note_shape(d, ax + sway * math.sin(p * 4 + k * 2), ay - rise * p,
                     (15 + 4 * p) * sc, _a(PURPLE, al), _a(LINE[:3], al), 2)
 
     return _particles(n, count, canvas, draw)
@@ -428,6 +479,10 @@ def fx_text(text: str, n: int = 12, anchors=None, canvas=(CANVAS, CANVAS),
     if size <= 0:
         room = ay if place == "above" else (ch - ay)
         size = int(max(20, min(76, (room - 8) / 0.62)))
+    # 글자가 작아질 대로 작아져도 자리가 모자라면 중심을 안으로 민다.
+    # 위아래로 까딱이는 폭(bob)과 10% 확대까지 더해서 잡아야 안 잘린다.
+    half = size * 0.62 * 1.10 + abs(bob) + 4 + SAFE
+    ay = max(half, min(ch - half, ay))
 
     font = load_font(size)
     stroke = max(3, size // 12)
