@@ -343,9 +343,41 @@ def check_cells(cells: List[Image.Image], min_area_ratio: float = 0.6,
     return problems
 
 
+MAX_TOTAL_FRAMES = 24          # 카카오 '움직이는 이모티콘' 상한
+
+
+def plan_sheets(n_frames: int, spread: str = "narrow") -> List[int]:
+    """
+    N프레임을 시트 몇 장에 나눠 담을지 정한다. 각 시트의 칸 수 목록을 돌려준다.
+
+    격자가 전부 2행이라 한 장에서 나오는 칸 수는 4·6·8 뿐이고 모두 짝수다.
+    그래서 15·21 같은 홀수는 한 장으로 못 만들고, 마지막 시트에서 남는 칸을 버린다.
+
+    예) 15 narrow -> [8, 8]      (16칸 중 15칸 사용, API 2회)
+        21 narrow -> [8, 8, 8]  (24칸 중 21칸 사용, API 3회)
+
+    모든 시트가 '같은 격자'가 되게 고른다. 섞으면 칸 모양이 달라져서 모델이
+    캐릭터를 다른 크기로 그린다. 실제로 12프레임을 [8,4](4x2 + 2x2)로 뽑았더니
+    뒤쪽 4장이 1.85배 커져서 재생할 때 캐릭터가 갑자기 부풀었다.
+    """
+    import math
+
+    n_frames = max(2, min(MAX_TOTAL_FRAMES, n_frames))
+    opts = SQUARE_CELL_LAYOUTS if spread == "wide" else tuple(SHEET_LAYOUTS)
+
+    best = None
+    for k in opts:
+        sheets = math.ceil(n_frames / k)
+        waste = sheets * k - n_frames
+        score = (sheets, waste)          # 호출 수를 먼저, 그다음 버리는 칸을 줄인다
+        if best is None or score < best[0]:
+            best = (score, [k] * sheets)
+    return best[1]
+
+
 def generate_sprite_sheet(character_description: str, steps: List[str],
                           quality: str = "high", spread: str = "narrow",
-                          retries: int = 2
+                          retries: int = 2, extra_refs: Optional[List[bytes]] = None
                           ) -> Tuple[Image.Image, int, int, int, List[str]]:
     """
     스프라이트 시트를 생성하고 분할이 멀쩡한지 확인한다.
@@ -355,9 +387,13 @@ def generate_sprite_sheet(character_description: str, steps: List[str],
     프레임 수는 줄지만, 토막 난 이모티콘을 내보내는 것보다 낫다.
     업로드 이미지가 있으면 그것을 레퍼런스로 쓰고, 없으면 설명만으로 그린다.
     """
-    refs = None
+    refs = []
     if _reference_image is not None:
-        refs = [_as_upload(_reference_image, _reference_mime, "character")]
+        refs.append(_as_upload(_reference_image, _reference_mime, "character"))
+    # 앞선 시트의 칸을 같이 보여주면 장 사이에서 캐릭터가 덜 달라진다
+    for i, extra in enumerate(extra_refs or []):
+        refs.append(_as_upload(extra, "image/png", f"prev{i}"))
+    refs = refs or None
 
     want = len(steps)
     plan = [spread, "wide"] if spread != "wide" else ["wide"]
@@ -551,6 +587,128 @@ def fill_interior_holes(img: Image.Image, cut: int = 128) -> Image.Image:
     alpha = img.getchannel("A")
     img.putalpha(ImageChops.lighter(alpha, filled))
     return img
+
+
+def _median_char_height(cells: List[Image.Image]) -> float:
+    """칸들에서 캐릭터 세로 높이의 중앙값."""
+    hs = []
+    for c in cells:
+        b = robust_bbox(c)
+        if b:
+            hs.append(b[3] - b[1])
+    if not hs:
+        return 0.0
+    hs.sort()
+    return float(hs[len(hs) // 2])
+
+
+def _match_height(cells: List[Image.Image], ref_h: float) -> List[Image.Image]:
+    """
+    이 시트의 캐릭터 높이를 기준 높이에 맞춘다.
+    장마다 크기가 다르면 재생할 때 캐릭터가 갑자기 커졌다 작아진다.
+    """
+    cur = _median_char_height(cells)
+    if cur <= 0 or abs(cur - ref_h) / ref_h < 0.04:
+        return cells
+    k = ref_h / cur
+    out = []
+    for c in cells:
+        w, h = c.size
+        nw, nh = max(1, int(w * k)), max(1, int(h * k))
+        sheet = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        sheet.paste(c.resize((nw, nh), Image.LANCZOS),
+                    ((w - nw) // 2, (h - nh) // 2))
+        out.append(sheet)
+    return out
+
+
+def generate_frames_multi(character_description: str, steps: List[str],
+                          quality: str = "high", spread: str = "narrow"
+                          ) -> Tuple[List[Image.Image], List[str], List[str]]:
+    """
+    필요한 만큼 스프라이트 시트를 여러 장 만들어 프레임을 모은다.
+    (프레임 리스트, 시트별 '가로x세로' 표기, 경고 목록)
+
+    한 장에 8칸까지만 들어가므로 12·15·24프레임 같은 요청은 여러 장이 필요하다.
+    두 번째 장부터는 '첫 장의 1번 칸'을 레퍼런스에 같이 넣어 캐릭터가 바뀌지 않게 한다.
+    (장마다 따로 그리면 장 사이에서 색과 비율이 달라진다)
+    """
+    plan = plan_sheets(len(steps), spread=spread)
+    frames: List[Image.Image] = []
+    grids: List[str] = []
+    warns: List[str] = []
+
+    anchor_cell: Optional[bytes] = None      # 첫 장의 1번 칸 — 이후 장의 기준
+    ref_h = 0.0                              # 첫 장의 캐릭터 높이 — 크기 기준
+
+    pos = 0
+    for idx, want in enumerate(plan):
+        chunk = steps[pos:pos + want]
+        pos += want
+        if not chunk:
+            break
+        # 칸이 남으면 마지막 자세로 채운다 (빈 칸은 모델이 멋대로 그린다)
+        while len(chunk) < want:
+            chunk.append(chunk[-1])
+
+        # 2장째부터는 원본 레퍼런스에 '첫 장의 1번 칸'을 덧붙인다.
+        # 원본을 교체해버리면 원래 색과 질감 기준을 잃는다.
+        extra = [anchor_cell] if anchor_cell is not None else None
+        sheet, cols, rows, n, w = generate_sprite_sheet(
+            character_description, chunk, quality=quality, spread=spread,
+            extra_refs=extra)
+        warns.extend(w)
+        grids.append(f"{cols}x{rows}")
+
+        cells = split_sheet(sheet, cols, rows)
+        cells = align_frames(cells)
+        if idx == 0 and cells:
+            anchor_cell = _to_png_bytes(cells[0])
+            ref_h = _median_char_height(cells)
+        elif cells and ref_h:
+            # 격자를 통일해도 장마다 캐릭터 크기가 조금씩 다르다. 1장 기준으로 맞춘다
+            cells = _match_height(cells, ref_h)
+        frames.extend(cells)
+
+    want_total = len(steps)
+    if len(frames) > want_total:
+        frames = frames[:want_total]              # 남는 칸은 버린다
+    elif len(frames) < want_total:
+        warns.append(f"요청 {want_total}프레임 중 {len(frames)}프레임만 얻었습니다")
+    return frames, grids, warns
+
+
+def save_with_budget(frames: List[Image.Image], path: str, durations,
+                     ) -> Tuple[int, List[str]]:
+    """
+    용량 한도를 적응적으로 적용해 저장한다.
+
+    프레임이 많으면 256KB(전 플랫폼 교집합)를 못 맞춘다. 그때 색을 32색까지
+    깎으면 화질이 무너지는데도 한도를 못 넘는 경우가 있었다(24프레임 실측 267KB).
+    그래서 먼저 256KB 를 노리고, 안 되면 색을 되돌리고 카카오 한도(650KB)로
+    올린 뒤 사용자에게 알린다.
+    """
+    notes: List[str] = []
+    size, note = shrink_until_under_limit(frames, path, durations,
+                                          limit=SAFE_MAX_BYTES)
+    if size <= SAFE_MAX_BYTES:
+        if note:
+            notes.append(note)
+        return size, notes
+
+    size = save_gif(frames, path=path, duration_ms=durations)   # 색 복원
+    if size <= KAKAO_MAX_BYTES:
+        notes.append(
+            f"{size/1024:.0f}KB — 카카오({KAKAO_MAX_BYTES//1024}KB)는 통과하지만 "
+            f"전 플랫폼 공통 한도({SAFE_MAX_BYTES//1024}KB)는 넘습니다. "
+            f"디스코드·라인에 쓰려면 프레임을 줄이세요")
+        return size, notes
+
+    size, note = shrink_until_under_limit(frames, path, durations,
+                                          limit=KAKAO_MAX_BYTES)
+    notes.append(f"용량이 커서 색을 줄였습니다 ({size/1024:.0f}KB). "
+                 f"프레임 수를 줄이는 쪽이 화질에 낫습니다")
+    return size, notes
 
 
 # ------------------- (4)+(5) 공통 바운딩박스 정렬 + 규격 캔버스
@@ -921,7 +1079,7 @@ def create_animated_emoticon(
 
     Args:
         character_description: 캐릭터의 외형, 색상, 분위기를 묘사한 영문 문장. 사용자가 이미지를 올렸다면 그 캐릭터를 유지하면서 보강할 설명을 쓴다.
-        frame_steps: 프레임별 자세를 묘사한 영문 문장 리스트. 6개 또는 8개를 권장하고 4개도 가능하다. 각 문장은 '한 장의 정지 그림'을 묘사하며 움직임을 설명하지 않는다. 동작이 자연스럽게 이어지도록 순서대로 쓰고, 반복 재생되므로 첫 번째와 마지막은 같은 기본 자세로 둔다. 마지막 자세가 이모티콘샵 썸네일이 되므로 캐릭터를 가장 잘 보여주는 자세로 한다. 효과나 글자는 쓰지 않는다. 예시는 front paw down at its side with a calm smile / front paw lifted to chest height / front paw raised high beside the head with an open smile 처럼 쓴다.
+        frame_steps: 프레임별 자세를 묘사한 영문 문장 리스트. 최소 4개에서 최대 24개까지 가능하다. 6개면 가장 빠르고 싸며(생성 1회, 약 45초), 12개는 2회, 24개는 3~4회가 든다. 사용자가 프레임 수를 말하지 않으면 6개 또는 8개로 한다. 동작이 복잡하거나 사용자가 부드럽게 해달라고 하면 12개 이상으로 늘린다. 15개를 넘으면 파일이 커져서 카카오 외 플랫폼 기준을 넘길 수 있다. 각 문장은 '한 장의 정지 그림'을 묘사하며 움직임을 설명하지 않는다. 동작이 자연스럽게 이어지도록 순서대로 쓰고, 반복 재생되므로 첫 번째와 마지막은 같은 기본 자세로 둔다. 마지막 자세가 이모티콘샵 썸네일이 되므로 캐릭터를 가장 잘 보여주는 자세로 한다. 효과나 글자는 쓰지 않는다. 예시는 front paw down at its side with a calm smile / front paw lifted to chest height / front paw raised high beside the head with an open smile 처럼 쓴다.
         pose_spread: 동작이 가로로 얼마나 퍼지는지 고른다. narrow 는 서 있거나 팔을 드는 것처럼 세로로 길쭉한 동작이다. wide 는 넘어지기, 눕기, 구르기, 대자로 뻗기처럼 가로로 넓게 퍼지는 동작이다. wide 를 고르면 칸을 크게 잡아 그림이 잘리지 않는다. 대신 프레임 수가 최대 6개로 줄어든다.
         effect: 덧붙일 효과를 고른다. none 은 효과 없음이다. heart 는 하트가 떠올라 설렘에 쓴다. sparkle 은 반짝임으로 최고나 뿌듯함에 쓴다. tear 는 눈물로 슬픔에 쓴다. sweat 는 땀방울로 당황에 쓴다. anger 는 김이 뿜어져 화남에 쓴다. note 는 음표가 떠올라 신남에 쓴다.
         overlay_text: 이모티콘에 넣을 짧은 한글 글자. 필요 없으면 빈 문자열로 둔다. ㅋㅋㅋ 고마워 미안 같이 짧을수록 좋다. 글자는 폰트로 정확히 찍히므로 그림에 맡기지 않는다.
@@ -937,18 +1095,12 @@ def create_animated_emoticon(
 
     try:
         # (1) 스프라이트 시트 1장 생성 — AI 호출은 여기 한 번뿐
-        sheet, cols, rows, n_cells, warns = generate_sprite_sheet(
+        cells, grids, warns = generate_frames_multi(
             character_description, frame_steps, quality=quality,
             spread=pose_spread)
-
-        # (2) 칸 분할
-        cells = split_sheet(sheet, cols, rows)
         if len(cells) < 2:
-            return (f"오류: 격자가 제대로 생성되지 않았습니다 "
-                    f"({len(cells)}/{n_cells}칸만 내용이 있음). 다시 시도해 보세요.")
-
-        # (3) 칸마다 어긋난 좌우 위치 맞추기
-        cells = align_frames(cells)
+            return ("오류: 격자가 제대로 생성되지 않았습니다. 다시 시도해 보세요."
+                    + ("\n사유: " + "; ".join(warns) if warns else ""))
 
         # (4) 투명 배경 정리
         cleaned = [stabilize_alpha(c) for c in cells]
@@ -975,8 +1127,8 @@ def create_animated_emoticon(
         durations[-1] = min(2000, speed_ms + max(0, hold_last_ms))
 
         # (8) 저장 — GIF + 번호 붙인 PNG 프레임(카카오 WebP Animator 용)
-        gif_size, note = shrink_until_under_limit(frames, GIF_PATH, durations,
-                                                  limit=SAFE_MAX_BYTES)
+        gif_size, size_notes = save_with_budget(frames, GIF_PATH, durations)
+        warns.extend(size_notes)
         webp_size = save_webp(frames, WEBP_PATH, durations)
 
         frames_dir = os.path.join(OUT_DIR, "frames")
@@ -992,7 +1144,7 @@ def create_animated_emoticon(
         frames_dir=frames_dir,
         frame_paths=[SHEET_PATH],          # AI가 그린 원본 = 스프라이트 시트 한 장
         unique_frames=len(frames), total_frames=len(frames),
-        loop_mode=f"{cols}x{rows} 시트", effect=effect,
+        loop_mode=f"시트 {len(grids)}장 ({'+'.join(grids)})", effect=effect,
         duration_ms=speed_ms, gif_size=gif_size, webp_size=webp_size,
     )
 
@@ -1001,14 +1153,12 @@ def create_animated_emoticon(
                if len(frames) != len(frame_steps) else "")
     return (
         f"이모티콘 생성 완료!\n"
-        f"- {cols}x{rows} 스프라이트 시트 1장을 생성해 {len(frames)}프레임으로 분할"
-        f"{dropped}\n"
+        f"- 스프라이트 시트 {len(grids)}장({' + '.join(grids)})을 생성해 "
+        f"{len(frames)}프레임으로 분할{dropped}\n"
         f"- 재생 {total_s:.1f}초 (프레임당 {speed_ms}ms, 마지막 {durations[-1]}ms)\n"
         + (f"- 효과: {effect}\n" if effect != "none" else "")
         + (f"- 글자: {overlay_text}\n" if overlay_text else "")
-        + f"- 규격: {CANVAS}x{CANVAS}px, 투명 배경, GIF {gif_size/1024:.0f}KB"
-          f" (한도 {SAFE_MAX_BYTES//1024}KB)\n"
-        + (f"- 참고: {note}\n" if note else "")
+        + f"- 규격: {CANVAS}x{CANVAS}px, 투명 배경, GIF {gif_size/1024:.0f}KB\n"
         + "".join(f"- 주의: {w}\n" for w in warns)
         + "화면 왼쪽 사이드바에서 미리보기와 다운로드가 가능하다고 사용자에게 안내하세요."
     )
