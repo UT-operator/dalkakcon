@@ -1047,8 +1047,14 @@ def shrink_until_under_limit(frames: List[Image.Image], path: str,
         pal = master if colors == 255 else _reduce_palette(master, colors)
         size = save_gif(frames, path=path, duration_ms=duration_ms, master=pal)
         if size <= limit:
-            note = (f"용량 한도({limit//1024}KB)를 맞추려고 색을 {colors}색으로 줄였습니다"
-                    if colors != 255 else "")
+            if colors == 255:
+                return size, ""
+            note = f"용량 한도({limit//1024}KB)를 맞추려고 색을 {colors}색으로 줄였습니다"
+            if colors <= 64:
+                # 평평한 그림은 64색 이하도 멀쩡하지만, 음영·그라데이션이 있으면
+                # 색 경계에 띠가 생긴다. 그때는 프레임을 줄이는 쪽이 낫다.
+                note += (". 음영이 많은 그림이면 색 띠가 보일 수 있으니, "
+                         "프레임 수를 줄이면 화질이 좋아집니다")
             return size, note
     return size, (f"32색으로 줄여도 {size/1024:.0f}KB "
                   f"(한도 {limit//1024}KB 초과) — 프레임 수를 줄여야 합니다")
